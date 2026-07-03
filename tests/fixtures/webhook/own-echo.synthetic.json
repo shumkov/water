@@ -1,0 +1,14 @@
+{
+  "type": "Message",
+  "event": {
+    "Info": {
+      "Chat": "120363419377779909@g.us",
+      "Sender": "66821683034@s.whatsapp.net",
+      "IsFromMe": true,
+      "IsGroup": true,
+      "ID": "3EB0DEADBEEF00112233",
+      "Timestamp": "2026-07-03T12:03:00Z"
+    },
+    "Message": { "conversation": "our reply" }
+  }
+}

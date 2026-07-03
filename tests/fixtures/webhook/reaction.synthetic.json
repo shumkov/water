@@ -1,0 +1,7 @@
+{
+  "type": "Message",
+  "event": {
+    "Info": { "Chat": "120363419377779909@g.us", "Sender": "66891112222@s.whatsapp.net", "IsGroup": true, "ID": "3EB0RRR", "Timestamp": "2026-07-03T12:04:00Z" },
+    "Message": { "reactionMessage": { "key": { "ID": "3EB0BOTMSG" }, "text": "👍" } }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "type": "Message",
+  "event": {
+    "Info": {
+      "Chat": "120363419377779909@g.us",
+      "Sender": "555123@lid",
+      "SenderAlt": "66891112222@s.whatsapp.net",
+      "IsFromMe": false,
+      "IsGroup": true,
+      "AddressingMode": "lid",
+      "ID": "3EB0AAA111",
+      "Timestamp": "2026-07-03T12:00:00Z",
+      "PushName": "Alice",
+      "Type": "text"
+    },
+    "Message": {
+      "extendedTextMessage": {
+        "text": "@umibot please check the order",
+        "contextInfo": { "mentionedJID": ["66821683034@s.whatsapp.net"] }
+      }
+    }
+  },
+  "userID": "u1",
+  "instanceName": "umi-spike"
+}

@@ -1,0 +1,24 @@
+{
+  "type": "Message",
+  "event": {
+    "Info": {
+      "Chat": "120363419377779909@g.us",
+      "Sender": "66891112222@s.whatsapp.net",
+      "IsGroup": true,
+      "AddressingMode": "pn",
+      "ID": "3EB0BBB222",
+      "Timestamp": "2026-07-03T12:01:00Z",
+      "PushName": "Bob"
+    },
+    "Message": {
+      "extendedTextMessage": {
+        "text": "2",
+        "contextInfo": {
+          "stanzaID": "3EB0BOTMSG",
+          "participant": "66821683034@s.whatsapp.net",
+          "quotedMessage": { "conversation": "1) blue 2) red" }
+        }
+      }
+    }
+  }
+}

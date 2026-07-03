@@ -1,0 +1,25 @@
+{
+  "type": "Message",
+  "event": {
+    "Info": {
+      "Chat": "66891112222@s.whatsapp.net",
+      "Sender": "66891112222@s.whatsapp.net",
+      "IsGroup": false,
+      "ID": "3EB0CCC333",
+      "Timestamp": "2026-07-03T12:02:00Z",
+      "PushName": "Carol"
+    },
+    "Message": {
+      "imageMessage": {
+        "caption": "here is the product",
+        "mimetype": "image/jpeg",
+        "url": "https://mmg.whatsapp.net/x",
+        "directPath": "/v/x",
+        "mediaKey": "AAAA",
+        "fileEncSha256": "BBBB",
+        "fileSha256": "CCCC",
+        "fileLength": 45210
+      }
+    }
+  }
+}
