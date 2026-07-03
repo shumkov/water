@@ -107,6 +107,17 @@ test('pre-connect failing twice throws preConnect WuzapiError (no infinite retry
   await assert.rejects(() => t.sendText({ chatJid: 'g@g.us', text: 'x' }), (e) => e instanceof WuzapiError && e.preConnect === true);
 });
 
+test('ECONNRESET is NOT retried (possibly-landed send → no double-send, I4)', async () => {
+  let n = 0;
+  const fetchImpl = async () => { n++; const e = new Error('reset'); e.cause = { code: 'ECONNRESET' }; throw e; };
+  const t = createTransport({ baseUrl: 'http://h', userToken: 'u', fetchImpl });
+  await assert.rejects(
+    () => t.sendText({ chatJid: 'g@g.us', text: 'x' }),
+    (e) => e instanceof WuzapiError && e.preConnect === false && e.code === 'ECONNRESET',
+  );
+  assert.equal(n, 1, 'ECONNRESET must be attempted exactly once, never retried');
+});
+
 test('groupParticipants maps JID/LID pairs', async () => {
   const fetchImpl = mockFetch({ data: { Participants: [{ JID: 'a@s.whatsapp.net', LID: 'a@lid' }, { JID: 'b@s.whatsapp.net' }] } });
   const t = createTransport({ baseUrl: 'http://h', userToken: 'u', fetchImpl });

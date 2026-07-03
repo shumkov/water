@@ -86,7 +86,20 @@ test('boot sweep flips crash-window pending rows to crashed-mid-send', () => {
   const ob = createOutbound(d, { now: () => clock });
   ob.reserve({ chatJid: 'g@g.us', text: 'x', account: 'umi' });
   clock = 100_000;
-  const rows = ob.sweepCrashed(60_000);
+  const rows = ob.sweepCrashed();
+  assert.equal(rows.length, 1);
+  assert.equal(d.prepare("SELECT error FROM messages WHERE direction='out'").get().error, 'crashed-mid-send');
+});
+
+test('boot sweep also catches a FRESH crash-window row (<60s old, reserved just before crash)', () => {
+  // Regression: sweepCrashed must not age-filter — a row reserved seconds before the
+  // crash would otherwise leak past boot and get mislabeled ambiguous-send 60s later.
+  let clock = 1000;
+  const d = db();
+  const ob = createOutbound(d, { now: () => clock });
+  ob.reserve({ chatJid: 'g@g.us', text: 'fresh', account: 'umi' });
+  clock = 6000; // 5s after reserve — a fast crash+restart
+  const rows = ob.sweepCrashed();
   assert.equal(rows.length, 1);
   assert.equal(d.prepare("SELECT error FROM messages WHERE direction='out'").get().error, 'crashed-mid-send');
 });

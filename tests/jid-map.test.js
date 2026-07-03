@@ -66,3 +66,13 @@ test('observe with only one side is a no-op (nothing to map yet)', () => {
   jm.observe({ pn: '1@s.whatsapp.net', lid: null, ts: 1 });
   assert.deepEqual([...jm.identitySet('1@s.whatsapp.net')], ['1@s.whatsapp.net']);
 });
+
+test('observe rejects a malformed/swapped pair (pn must be @s.whatsapp.net, lid @lid)', () => {
+  const jm = createJidMap(db());
+  // swapped: pn slot holds a lid, lid slot holds a pn — must be rejected, not stored
+  jm.observe({ pn: '5@lid', lid: '5@s.whatsapp.net', ts: 1 });
+  assert.deepEqual([...jm.identitySet('5@lid')], ['5@lid']);
+  // garbage server
+  jm.observe({ pn: '5@g.us', lid: '6@lid', ts: 1 });
+  assert.deepEqual([...jm.identitySet('6@lid')], ['6@lid']);
+});

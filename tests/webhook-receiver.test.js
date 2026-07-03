@@ -24,10 +24,11 @@ async function post(base, pathname, rawBody, { signIt = true, sig } = {}) {
 let base, recv, seen;
 
 before(async () => {
-  seen = { messages: [], reactions: [], connections: [], failCommit: false };
+  seen = { messages: [], reactions: [], connections: [], emits: [], failCommit: false, heartbeatAgeS: 1 };
   recv = createReceiver({
     port: 0, pathToken: TOKEN, hmacKey: KEY,
-    healthPayload: () => ({ heartbeatAgeS: 1 }),
+    healthPayload: () => ({ heartbeatAgeS: seen.heartbeatAgeS }),
+    emit: (name, data) => seen.emits.push({ name, data }),
     handlers: {
       onMessage: async (m) => { if (seen.failCommit) throw new Error('disk full'); seen.messages.push(m); },
       onReaction: async (e) => seen.reactions.push(e),
@@ -54,12 +55,21 @@ test('a valid signed Message commits and returns 200', async () => {
   assert.equal(seen.messages.at(-1).msgId, '3EB0AAA111');
 });
 
-test('bad HMAC → 401, no handler call', async () => {
+test('bad HMAC → 401, no handler call, emits webhook-auth-fail (feeds 401-storm alarm)', async () => {
   const raw = fixtureRaw('group-text-mention.synthetic.json');
   const before = seen.messages.length;
   const r = await post(base, `/hook/${TOKEN}`, raw, { sig: 'deadbeef' });
   assert.equal(r.status, 401);
   assert.equal(seen.messages.length, before);
+  assert.equal(seen.emits.at(-1).name, 'webhook-auth-fail');
+});
+
+test('healthz returns 503 when the heartbeat is stale', async () => {
+  seen.heartbeatAgeS = 9999;
+  const res = await fetch(base + '/healthz');
+  assert.equal(res.status, 503);
+  assert.equal((await res.json()).ok, false);
+  seen.heartbeatAgeS = 1;
 });
 
 test('missing signature → 401', async () => {
@@ -80,12 +90,30 @@ test('unparseable body (valid HMAC) → 400', async () => {
   assert.equal(r.status, 400);
 });
 
-test('commit failure → 500 (write-before-ack backstop, wuzapi will retry)', async () => {
+test('commit failure → 500 (write-before-ack backstop, wuzapi will retry) + emits', async () => {
   seen.failCommit = true;
   const raw = fixtureRaw('own-echo.synthetic.json');
   const r = await post(base, `/hook/${TOKEN}`, raw);
   assert.equal(r.status, 500);
+  assert.equal(seen.emits.at(-1).name, 'webhook-handle-error');
   seen.failCommit = false;
+});
+
+test('oversize body → a real 413 response is delivered (not a socket reset)', async () => {
+  // Dedicated small-cap receiver so the test needs neither a 9 MB allocation nor the
+  // shared harness connection (a mid-upload 413+close must not poison sibling tests).
+  const small = createReceiver({ port: 0, pathToken: TOKEN, hmacKey: KEY, bodyCap: 1024, handlers: {} });
+  const addr = await small.listen();
+  try {
+    const res = await fetch(`http://127.0.0.1:${addr.port}/hook/${TOKEN}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-hmac-signature': 'x', connection: 'close' },
+      body: Buffer.alloc(4096, 0x61), // 4 KB > 1 KB cap
+    });
+    assert.equal(res.status, 413);
+  } finally {
+    await small.close();
+  }
 });
 
 test('reaction event routes to onReaction and 200s', async () => {

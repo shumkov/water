@@ -1,10 +1,11 @@
 -- water v1 schema. See docs/IMPLEMENTATION.md §2 and docs/SPEC.md §5.
 -- Applied by lib/db.js inside BEGIN IMMEDIATE; user_version is set to the max
 -- migration number, so adding a file never needs a hand-bumped constant.
-
-PRAGMA journal_mode = WAL;
-PRAGMA busy_timeout = 5000;
-PRAGMA foreign_keys = ON;
+--
+-- Connection pragmas (journal_mode=WAL, busy_timeout, foreign_keys) are set by
+-- openDb() on the connection BEFORE migrations run — they must not appear here,
+-- because journal_mode cannot be changed inside a transaction and this file is
+-- executed inside one.
 
 -- Full transcript: inbound, outbound, system. The durable inbox.
 CREATE TABLE messages (

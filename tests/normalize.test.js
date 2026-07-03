@@ -86,6 +86,39 @@ test('revoke protocolMessage normalizes to a revoke', () => {
   assert.equal(r.targetMsgId, '3EB0GONE');
 });
 
+test('MESSAGE_EDIT protocolMessage: edit.targetMsgId + edited text folds in', () => {
+  const raw = {
+    type: 'Message',
+    event: {
+      Info: { Chat: 'g@g.us', Sender: 's@s.whatsapp.net', IsGroup: true, ID: 'E1', Timestamp: '2026-07-03T00:00:00Z' },
+      Message: {
+        protocolMessage: {
+          type: 'MESSAGE_EDIT',
+          key: { ID: '3EB0ORIG' },
+          editedMessage: { conversation: 'corrected price is 500' },
+        },
+      },
+    },
+  };
+  const r = normalize(raw);
+  assert.equal(r.type, 'message');
+  assert.equal(r.message.edit.targetMsgId, '3EB0ORIG');
+  assert.equal(r.message.text, 'corrected price is 500');
+});
+
+test('editedMessage without explicit type still detected as an edit', () => {
+  const raw = {
+    type: 'Message',
+    event: {
+      Info: { Chat: 'g@g.us', Sender: 's@s.whatsapp.net', IsGroup: true, ID: 'E2', Timestamp: '2026-07-03T00:00:00Z' },
+      Message: { protocolMessage: { key: { ID: '3EB0ORIG2' }, editedMessage: { extendedTextMessage: { text: 'fixed' } } } },
+    },
+  };
+  const r = normalize(raw);
+  assert.equal(r.message.edit.targetMsgId, '3EB0ORIG2');
+  assert.equal(r.message.text, 'fixed');
+});
+
 test('casing-defensive: PascalCase media fields also parse', () => {
   const raw = {
     type: 'Message',
