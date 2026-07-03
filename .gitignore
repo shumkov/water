@@ -1,0 +1,10 @@
+node_modules/
+*.db
+*.db-wal
+*.db-shm
+inbox/
+config.json
+heartbeat.json
+coverage/
+*.log
+.DS_Store

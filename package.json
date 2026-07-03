@@ -1,0 +1,39 @@
+{
+  "name": "watergram",
+  "version": "0.0.0",
+  "description": "WhatsApp daemon for Claude Code — one interactive Claude session per WhatsApp chat, over WuzAPI (whatsmeow), with polygram's reliability architecture.",
+  "type": "commonjs",
+  "bin": {
+    "water": "water.js",
+    "water-doctor": "bin/water-doctor.js",
+    "water-ipc": "bin/water-ipc.js"
+  },
+  "scripts": {
+    "test": "node --test --test-force-exit tests/*.test.js",
+    "coverage": "node --test --experimental-test-coverage tests/*.test.js",
+    "start": "node water.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0"
+  },
+  "keywords": [
+    "whatsapp",
+    "claude-code",
+    "claude",
+    "wuzapi",
+    "whatsmeow",
+    "bot",
+    "daemon",
+    "per-chat-session",
+    "polygram"
+  ],
+  "author": "Ivan Shumkov <ivanshumkov@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shumkov/water.git"
+  }
+}

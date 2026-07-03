@@ -1,0 +1,47 @@
+{
+  "accounts": {
+    "umi": {
+      "wuzapi": { "baseUrl": "http://127.0.0.1:8099" },
+      "webhook": { "port": 8090 },
+      "dmPolicy": "allowlist",
+      "groupPolicy": "allowlist",
+      "adminJids": ["<ivan-pn>@s.whatsapp.net", "<ivan-lid>@lid"],
+      "allowConfigCommands": true,
+      "mediaMaxMb": 32,
+      "inboxMaxGb": 20,
+      "escalation": {
+        "ipcBot": "shumabit",
+        "chatId": "68861949",
+        "slaMinutes": 10,
+        "quietHours": { "from": "01:00", "to": "07:00", "tz": "Asia/Bangkok" }
+      },
+      "holdingReply": {
+        "en": "Hi! We're on it — a human will follow up shortly. – UMI",
+        "th": "สวัสดีค่ะ ทีมงานกำลังดำเนินการ เดี๋ยวมีเจ้าหน้าที่ติดต่อกลับนะคะ – UMI"
+      },
+      "voice": { "enabled": true, "provider": "openai" },
+      "ackReaction": { "dm": "always", "group": "mentions" },
+      "processBudget": 9
+    }
+  },
+  "chats": {
+    "120363419377779909@g.us": {
+      "name": "Umi sales",
+      "account": "umi",
+      "agent": "umi-partner",
+      "cwd": "/home/shumabit/agents/umi-sales",
+      "model": "sonnet",
+      "effort": "medium",
+      "requireMention": true,
+      "mentionPatterns": ["\\bumi\\b"],
+      "maxTurn": 600000,
+      "maxTurnHard": 5400000
+    }
+  },
+  "defaults": {
+    "model": "sonnet",
+    "effort": "medium",
+    "maxTurn": 600000,
+    "maxTurnHard": 5400000
+  }
+}
