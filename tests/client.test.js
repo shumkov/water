@@ -25,7 +25,8 @@ test('sendText posts PascalCase body with token header, returns {msgId, ts}', as
   const fetchImpl = mockFetch({ data: { Details: 'Sent', Timestamp: 1720000000, Id: '3EB0X' } });
   const t = createTransport({ baseUrl: 'http://127.0.0.1:8099/', userToken: 'utok', fetchImpl });
   const r = await t.sendText({ chatJid: '120@g.us', text: 'hi' });
-  assert.deepEqual(r, { msgId: '3EB0X', ts: 1720000000 });
+  // wuzapi Timestamp is unix SECONDS; the client normalizes to ms (matches inbound ts).
+  assert.deepEqual(r, { msgId: '3EB0X', ts: 1720000000000 });
   const c = fetchImpl.calls[0];
   assert.equal(c.url, 'http://127.0.0.1:8099/chat/send/text');
   assert.equal(c.headers.token, 'utok');

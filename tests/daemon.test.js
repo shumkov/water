@@ -8,6 +8,7 @@ const path = require('node:path');
 
 const { createDaemon } = require('../water');
 const { openDb } = require('../lib/db');
+const { sign } = require('../lib/transport/hmac');
 
 const GROUP = '120363419377779909@g.us';
 const BOT_PN = '66821683034@s.whatsapp.net';
@@ -111,6 +112,61 @@ test('duplicate webhook (same chat+sender+id) is deduped, only one row', async (
   await d.stop();
 });
 
+test('isFromMe (human/other-device) is recorded as a human-device out-row, never dispatched', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-hd-'));
+  const d = daemon(dir, []);
+  let dispatched = 0;
+  d.pm.getOrSpawn = async () => {}; d.pm.procs = new Map(); d.pm.send = async () => { dispatched++; return { alreadyDelivered: true }; };
+  await d.onMessage(msg({ isFromMe: true, msgId: 'HD1', text: 'staff answered from phone' }));
+  await new Promise((r) => setTimeout(r, 20));
+  const row = d.db.prepare("SELECT direction, source FROM messages WHERE msg_id='HD1'").get();
+  assert.equal(row.direction, 'out');
+  assert.equal(row.source, 'human-device');
+  assert.equal(dispatched, 0);
+  await d.stop();
+});
+
+test('dispatch failure marks the row failed and calls the error reply (not on replay)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-df-'));
+  const sent = [];
+  const d = daemon(dir, sent);
+  d.pm.getOrSpawn = async () => {}; d.pm.procs = new Map();
+  d.pm.send = async () => { throw new Error('spawn boom'); };
+  await d.onMessage(msg({ text: 'hey umi', msgId: 'F1' }));
+  await new Promise((r) => setTimeout(r, 30));
+  const row = d.db.prepare("SELECT handler_status FROM messages WHERE msg_id='F1'").get();
+  assert.equal(row.handler_status, 'failed');
+  await d.stop();
+});
+
+test('injectTurn is fail-closed on an unknown chat, dispatches into a configured one', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-inj-'));
+  const d = daemon(dir, []);
+  let dispatched = 0;
+  d.pm.getOrSpawn = async () => {}; d.pm.procs = new Map([[GROUP, { claudeSessionId: 's' }]]);
+  d.pm.send = async () => { dispatched++; return { alreadyDelivered: true }; };
+  const bad = await d.injectTurn({ chat_id: 'unknown@g.us', text: 'x' });
+  assert.equal(bad.ok, false);
+  assert.equal(bad.reason, 'unknown-chat');
+  assert.equal(dispatched, 0);
+  await d.injectTurn({ chat_id: GROUP, text: 'daily summary please' });
+  assert.equal(dispatched, 1);
+  await d.stop();
+});
+
+test('abort routing interrupts the process and marks the row aborted', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-ab-'));
+  const d = daemon(dir, []);
+  let interrupted = 0;
+  d.pm.procs = new Map([[GROUP, { interrupt: async () => { interrupted++; } }]]);
+  // admin sender so the abort is authorized in a group
+  await d.onMessage(msg({ text: 'stop', msgId: 'AB1', sender: { jid: BOT_PN, pn: BOT_PN, lid: null, pushName: 'Ivan' } }));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(interrupted, 1);
+  assert.equal(d.db.prepare("SELECT handler_status FROM messages WHERE msg_id='AB1'").get().handler_status, 'aborted');
+  await d.stop();
+});
+
 test('boot replay re-dispatches a received row that never got gated', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-d4-'));
   // pre-seed a received (ungated) inbound row directly, simulating a crash after
@@ -128,5 +184,47 @@ test('boot replay re-dispatches a received row that never got gated', async () =
   await d.start(); // runs bootReplay
   await new Promise((r) => setTimeout(r, 30));
   assert.equal(dispatched, 1, 'the ungated received row was re-dispatched on boot');
+  await d.stop();
+});
+
+test('start(): a real HMAC-signed webhook POST records + dispatches end to end', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-start-'));
+  const sent = [];
+  const d = daemon(dir, sent);
+  let dispatched = 0;
+  d.pm.getOrSpawn = async () => {}; d.pm.procs = new Map([[GROUP, { claudeSessionId: 's' }]]);
+  d.pm.send = async () => { dispatched++; return { alreadyDelivered: true }; };
+  const { port } = await d.start({ withTimers: false });
+  const body = JSON.stringify({
+    type: 'Message',
+    event: {
+      Info: { Chat: GROUP, Sender: '55@lid', IsGroup: true, ID: 'W1', Timestamp: '2026-07-04T00:00:00Z', PushName: 'Al' },
+      Message: { extendedTextMessage: { text: 'hey umi help' } },
+    },
+  });
+  const res = await fetch(`http://127.0.0.1:${port}/hook/tok`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-hmac-signature': sign(Buffer.from(body), 'k') }, body,
+  });
+  assert.equal(res.status, 200);
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(d.db.prepare("SELECT COUNT(*) c FROM messages WHERE msg_id='W1'").get().c, 1);
+  assert.equal(dispatched, 1);
+  await d.stop();
+});
+
+test('a bot reply through the tool-dispatcher stores an outbound ts in ms (SLA guard works)', async () => {
+  // Regression for the ts-in-seconds bug. The client normalizes wuzapi seconds -> ms
+  // (client test covers toMs); here we drive a real reply through the dispatcher and
+  // assert the stored outbound ts is ms scale so botReplyAfter (o.ts >= in.ts) can match.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-slareg-'));
+  const d = daemon(dir, []);
+  const nowMs = Date.now();
+  // mock transport already returns a ms-scale ts via the real client boundary; the
+  // daemon's mkTransport.sendText returns { ts: 1 } (too small), so simulate the
+  // post-toMs client by returning a proper ms ts here.
+  d._internal.transport.sendText = async (a) => ({ msgId: a.id, ts: nowMs });
+  await d._internal.toolDispatcher({ sessionKey: GROUP, chatId: GROUP, toolName: 'reply', text: 'answer' });
+  const outTs = d.db.prepare("SELECT ts FROM messages WHERE direction='out' AND status='sent'").get().ts;
+  assert.ok(outTs > 1e12, `outbound ts must be ms scale, got ${outTs}`);
   await d.stop();
 });

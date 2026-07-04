@@ -60,6 +60,18 @@ test('reply: a send failure marks the row failed and returns ok:false', async ()
   assert.equal(db.prepare("SELECT status FROM messages WHERE direction='out'").get().status, 'failed');
 });
 
+test('reply: a possibly-landed send (TIMEOUT) is marked ambiguous, not plain-failed (I4)', async () => {
+  const db = openDb(path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'water-amb-')), 't.db'));
+  const outbound = createOutbound(db, { now: () => 1000 });
+  const transport = {
+    async sendText() { const e = new Error('timed out'); e.code = 'TIMEOUT'; throw e; },
+  };
+  const td = createChannelsToolDispatcher({ transport, outbound, account: 'umi', chunkText: chunkMarkdownText, formatText: toWhatsApp });
+  const r = await td({ sessionKey: 'g@g.us', chatId: 'g@g.us', toolName: 'reply', text: 'hi' });
+  assert.equal(r.ok, false);
+  assert.equal(db.prepare("SELECT error FROM messages WHERE direction='out'").get().error, 'ambiguous-send');
+});
+
 test('edit_message: ownership gate blocks a non-owned message', async () => {
   const { td } = harness();
   const r = await td({ sessionKey: 'g@g.us', chatId: 'g@g.us', toolName: 'edit_message', messageId: 'NOTMINE', text: 'x' });

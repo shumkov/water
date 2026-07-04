@@ -92,9 +92,33 @@ function createDaemon({ config, account, dataDir, logger = console, transport: i
   }
   const attachmentsFor = (row) => db.prepare('SELECT * FROM attachments WHERE message_id=?').all(row.id);
 
+  // Pull-model media fetch (SPEC §4.1): download bytes only for a dispatched turn,
+  // size-checked against the cap before fetching. Over-cap/failure -> failed row ->
+  // <attachment-failed> in the prompt. Voice transcription is roadmap.
+  const setAttDownloaded = db.prepare("UPDATE attachments SET download_status='downloaded', local_path=@path WHERE id=@id");
+  const setAttFailed = db.prepare("UPDATE attachments SET download_status='failed', error=@error WHERE id=@id");
+  async function fetchMedia(att, { maxBytes }) {
+    let ref;
+    try { ref = JSON.parse(att.media_ref_json || '{}'); } catch { ref = {}; }
+    if ((att.size_bytes || ref.FileLength || 0) > maxBytes) { setAttFailed.run({ id: att.id, error: 'oversize' }); return; }
+    try {
+      const { buffer } = await transport.downloadMedia(ref, att.kind);
+      const dir = path.join(dataDir, 'inbox', att_dirsafe(att));
+      require('node:fs').mkdirSync(dir, { recursive: true });
+      const ext = (att.mime_type || '').split('/')[1] || 'bin';
+      const dest = path.join(dir, `${att.id}.${ext}`);
+      const tmp = `${dest}.tmp`;
+      require('node:fs').writeFileSync(tmp, buffer);
+      require('node:fs').renameSync(tmp, dest); // atomic
+      setAttDownloaded.run({ id: att.id, path: dest });
+    } catch (e) { setAttFailed.run({ id: att.id, error: e?.message || 'download failed' }); }
+  }
+  const att_dirsafe = (att) => String(att.message_id);
+
   const dispatcher = createDispatcher({
     pm, sessions, status, resolveChat: resolve, defaults: scoped.defaults,
-    deliverFallback, errorReply, classify, attachmentsFor, logEvent, logger,
+    deliverFallback, errorReply, classify, attachmentsFor, fetchMedia,
+    mediaMaxBytes: (acc.mediaMaxMb || 32) * 1024 * 1024, logEvent, logger,
   });
 
   // Ops: escalation (-> polygram IPC -> Telegram), SLA + transport watchdogs, heartbeat.
@@ -120,13 +144,13 @@ function createDaemon({ config, account, dataDir, logger = console, transport: i
 
   // Route one recorded inbound through the gate. Fire-and-forget from onMessage so the
   // webhook acks fast; a turn runs in the background.
-  async function processInbound(msg, rowId) {
+  async function processInbound(msg, rowId, { isReplay = false } = {}) {
     const row = { id: rowId };
     const d = gate.decide(msg);
     logEvent(`gate-${d.action}`, { chatJid: msg.chatJid, reason: d.reason, sender: msg.sender.jid });
     switch (d.action) {
       case 'dispatch':
-        return dispatcher.dispatch(msg.chatJid, msg, row).catch((e) => logger.error?.('dispatch', e?.message));
+        return dispatcher.dispatch(msg.chatJid, msg, row, { isReplay }).catch((e) => logger.error?.('dispatch', e?.message));
       case 'abort':
         try { await pm.procs?.get(msg.chatJid)?.interrupt?.(); } catch { /* */ }
         return status.markAborted(rowId);
@@ -143,6 +167,26 @@ function createDaemon({ config, account, dataDir, logger = console, transport: i
 
   async function onMessage(msg) {
     jidMap.observeSender({ jid: msg.sender.jid, altJid: msg.sender.altJid, pushName: msg.sender.pushName, ts: msg.tsMs });
+    // isFromMe: never dispatched. Our own send echo (matches a minted id) is delivery
+    // evidence; anything else is a human/other-device send — recorded as an out-row
+    // (source='human-device') so the SLA watchdog's human-active suppression can see it.
+    if (msg.isFromMe) {
+      if (!outbound.isOwnSend(msg.chatJid, msg.msgId)) {
+        try { recordInbound(msg, { account, direction: 'out', source: 'human-device' }); } catch (e) { logger.error?.('record human-device', e?.message); }
+      }
+      return;
+    }
+    // Inbound edit: update the ORIGINAL message's text + edited_ts in place (v1 —
+    // edit-correction injection is roadmap); don't create a second row keyed on the
+    // edit's own id (SPEC §4.1).
+    if (msg.edit?.targetMsgId) {
+      try {
+        db.prepare('UPDATE messages SET text=@text, edited_ts=@ts WHERE chat_jid=@chat AND msg_id=@target')
+          .run({ text: msg.text ?? null, ts: msg.tsMs, chat: msg.chatJid, target: msg.edit.targetMsgId });
+      } catch (e) { logger.error?.('record edit', e?.message); }
+      logEvent('inbound-edit', { chatJid: msg.chatJid, target: msg.edit.targetMsgId });
+      return;
+    }
     const rec = recordInbound(msg, { account }); // throws on DB failure -> 500 -> wuzapi retries
     if (rec.deduped || !rec.rowId) return;       // already handled (retry/replay/reorder)
     processInbound(msg, rec.rowId).catch((e) => logger.error?.('processInbound', e?.message));
@@ -152,8 +196,11 @@ function createDaemon({ config, account, dataDir, logger = console, transport: i
     await transportWatchdog.onConnectionEvent(ev);
   }
 
-  // IPC-injected synthetic turn (cron jobs) — runs through the normal pipeline.
+  // IPC-injected synthetic turn (cron jobs). Trusted (IPC-secret-gated) so it skips
+  // the mention gate — but still fail-closed on the configured-chat boundary: never
+  // dispatch a Claude turn + WhatsApp send into a chat that isn't in config.
   async function injectTurn({ chat_id, text, source = 'cron' }) {
+    if (!resolve(chat_id)) return { ok: false, reason: 'unknown-chat' };
     const synthetic = {
       chatJid: chat_id, chatType: chat_id.endsWith('@g.us') ? 'group' : 'dm', msgId: `inj-${Date.now()}`,
       sender: { jid: 'water:inject', altJid: null, pushName: source, pn: null, lid: null },
@@ -174,19 +221,39 @@ function createDaemon({ config, account, dataDir, logger = console, transport: i
     } catch (e) { logger.warn?.('learnIdentity failed', e?.message); }
   }
 
-  // Boot replay (SPEC §4.2): re-gate never-gated `received` rows always; recover
-  // interrupted dispatched rows unless completed. (Clean/crash disposition + notices
-  // are refined in 1b-D; v1 recovers unanswered work.)
+  // Boot replay (SPEC §4.2). Restart-intent disposition via the clean-shutdown marker:
+  //  - `received` rows (never gated) ALWAYS re-gate — no turn ever started, so no dup.
+  //  - `dispatched`/`replay-pending` rows (a turn had started): crash → recover;
+  //    clean restart → skip (they were drained at shutdown, not lost).
+  // Completion is gated on turn_metrics OR a delivered bot-reply after the inbound
+  // (an out-row source='bot-reply' status='sent' ts >= inbound ts). Candidates
+  // shadowed by a newer authorized abort are dropped (never resurrect a killed turn).
+  const readCleanShutdown = db.prepare("SELECT v FROM daemon_state WHERE k='clean_shutdown_at'");
+  const clearCleanShutdown = db.prepare("DELETE FROM daemon_state WHERE k='clean_shutdown_at'");
+  const newerAbort = db.prepare("SELECT text, sender_jid, chat_jid FROM messages WHERE chat_jid=? AND direction='in' AND ts>? ");
+  const botReplyAfterIn = db.prepare("SELECT 1 FROM messages WHERE chat_jid=? AND direction='out' AND source='bot-reply' AND status='sent' AND ts>=? LIMIT 1");
+  const { isAbort } = require('./lib/handlers/abort-detector');
+
   async function bootReplay(windowMs = 2 * 3600_000) {
     const cutoff = Date.now() - windowMs;
-    let replayed = 0;
+    let cleanRestart = false;
+    try { const m = readCleanShutdown.get(); cleanRestart = !!(m && m.v); clearCleanShutdown.run(); }
+    catch { cleanRestart = false; } // any ambiguity → treat as crash → recover
+    let replayed = 0, skipped = 0;
     for (const r of status.replayCandidates(cutoff)) {
-      if (status.hasCompletedTurn(r.chat_jid, r.msg_id)) { status.markReplaySkipped(r.id); continue; }
+      const startedTurn = r.handler_status === 'dispatched' || r.handler_status === 'replay-pending';
+      // completion: a metrics row OR a delivered reply after this inbound
+      if (status.hasCompletedTurn(r.chat_jid, r.msg_id) || botReplyAfterIn.get(r.chat_jid, r.ts)) { status.markReplaySkipped(r.id); continue; }
+      // clean restart: a turn that had started was drained, not lost — skip it.
+      if (startedTurn && cleanRestart) { status.markReplaySkipped(r.id); skipped++; continue; }
+      // never resurrect a turn the user explicitly aborted after this message.
+      const abortShadow = newerAbort.all(r.chat_jid, r.ts).some((a) => isAbort(a.text));
+      if (abortShadow) { status.markReplaySkipped(r.id); skipped++; continue; }
       status.markReplayAttempted(r.id);
       const msg = reconstruct(r);
-      try { await processInbound(msg, r.id); replayed++; } catch (e) { logger.error?.('replay', e?.message); }
+      try { await processInbound(msg, r.id, { isReplay: true }); replayed++; } catch (e) { logger.error?.('replay', e?.message); }
     }
-    if (replayed) logger.log?.(`[water] boot replay re-dispatched ${replayed} message(s)`);
+    if (replayed || skipped) logger.log?.(`[water] boot replay: re-dispatched ${replayed}, skipped ${skipped} (${cleanRestart ? 'clean' : 'crash'} restart)`);
   }
 
   // Rebuild a minimal normalized message from a stored row for replay.
@@ -204,6 +271,7 @@ function createDaemon({ config, account, dataDir, logger = console, transport: i
   let ipc = null;
   let slaTimer = null;
   let pollTimer = null;
+  let ambigTimer = null;
   async function start({ withTimers = true } = {}) {
     await learnIdentity();
     const pathToken = acc.webhook?.pathToken || 'water';
@@ -216,6 +284,10 @@ function createDaemon({ config, account, dataDir, logger = console, transport: i
     });
     const addr = await receiver.listen();
     logger.log?.(`[water] account=${account} webhook on ${addr.address}:${addr.port}/hook/${pathToken}`);
+    // Eager webhook assert/repair at boot (not just the 60s poll): a reverted/lost
+    // wuzapi webhook subscription would otherwise silently drop all inbound until the
+    // first poll fires. Best-effort — a down wuzapi is caught by the poll + escalation.
+    try { await transportWatchdog.poll(); } catch (e) { logger.warn?.('boot webhook reconcile', e?.message); }
 
     // water's own IPC socket (cron injectTurn, operator sends). Allowlisted ops.
     try {
@@ -237,6 +309,12 @@ function createDaemon({ config, account, dataDir, logger = console, transport: i
     if (withTimers) {
       slaTimer = setInterval(() => sla.tick().catch((e) => logger.error?.('sla', e?.message)), 30_000); slaTimer.unref?.();
       pollTimer = setInterval(() => transportWatchdog.poll().catch((e) => logger.error?.('poll', e?.message)), 60_000); pollTimer.unref?.();
+      // Ambiguous-send sweeper: flip outbound rows stuck 'pending' > 60s to
+      // failed('ambiguous-send') (a crashed/lost send callback) and GC the sent-cache.
+      ambigTimer = setInterval(() => {
+        try { for (const r of outbound.sweepAmbiguous()) logEvent('ambiguous-send', { chatJid: r.chat_jid, msgId: r.msg_id }); }
+        catch (e) { logger.error?.('ambig-sweep', e?.message); }
+      }, 30_000); ambigTimer.unref?.();
     }
     return { port: addr.port };
   }
@@ -244,6 +322,7 @@ function createDaemon({ config, account, dataDir, logger = console, transport: i
   async function stop() {
     if (slaTimer) clearInterval(slaTimer);
     if (pollTimer) clearInterval(pollTimer);
+    if (ambigTimer) clearInterval(ambigTimer);
     heartbeat.stop();
     if (receiver) await receiver.close();
     try { ipc?.close?.(); } catch { /* */ }
