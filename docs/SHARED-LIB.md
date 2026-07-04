@@ -80,3 +80,12 @@ module behind the 2026-06-21/22 outages) could be extracted into a tiny shared
 package independently of the rest, if de-duplicating just the binary-pinning pain
 becomes worthwhile before the full extraction. Recorded here as an option, not a
 current action.
+
+
+---
+
+## Status: extracted (water side) — 2026-07-04
+
+The engine now lives in [`@shumkov/orchestra`](https://github.com/shumkov/orchestra); water depends on it (`file:../orchestra`, will be an npm range on publish). The real-claude E2E passes against the extracted package (a WhatsApp message injected via the bridge round-trips through `mcp__water-bridge__reply`). Two cli-process app-couplings (display-hint, file-cap) became injected options — the only divergence from the proven copy; recorded in orchestra's `docs/EXTRACTION.md`.
+
+**Polygram migration is NOT done here** — it modifies a production revenue system and gets its own spec + review + Ivan's merge (see below).

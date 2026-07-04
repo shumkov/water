@@ -15,9 +15,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 const require = createRequire(import.meta.url);
 
-const { CliProcess } = require('../../lib/process/cli-process.js');
-const { createTmuxRunner } = require('../../lib/tmux/tmux-runner.js');
-const { ensureVendoredClaudeBin, CLAUDE_CLI_PINNED_VERSION } = require('../../lib/claude-bin.js');
+const { CliProcess, createTmuxRunner, claudeBin } = require('@shumkov/orchestra');
+const { ensureVendoredClaudeBin, CLAUDE_CLI_PINNED_VERSION } = claudeBin;
 
 const NONCE = 'PONG-' + Math.floor(Date.now() / 1000);
 const CHAT_JID = '120363419377779909@g.us';           // a real WhatsApp group JID shape
@@ -26,8 +25,8 @@ const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'water-prove-'));
 
 const vendored = ensureVendoredClaudeBin(CLAUDE_CLI_PINNED_VERSION);
 if (!vendored.ok) { console.error(`[prove] cannot vendor claude: ${vendored.reason}`); process.exit(1); }
-const claudeBin = vendored.path;
-console.log(`[prove] claude=${claudeBin}\n[prove] nonce=${NONCE} chat=${CHAT_JID}\n[prove] cwd=${cwd}`);
+const claudeBinPath = vendored.path;
+console.log(`[prove] claude=${claudeBinPath}\n[prove] nonce=${NONCE} chat=${CHAT_JID}\n[prove] cwd=${cwd}`);
 
 const tmuxRunner = createTmuxRunner({ logger: console });
 
@@ -41,7 +40,7 @@ const toolDispatcher = async ({ toolName, text, chatId }) => {
 
 const proc = new CliProcess({
   sessionKey: SESSION_KEY, chatId: CHAT_JID, threadId: null, label: 'prove',
-  tmuxRunner, botName: 'water-prove', claudeBin, toolDispatcher, logger: console,
+  tmuxRunner, botName: 'water-prove', claudeBin: claudeBinPath, toolDispatcher, displayHint: '', logger: console,
 });
 
 proc.on('init', (i) => console.log(`[prove] init session=${i.session_id}`));

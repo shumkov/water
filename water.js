@@ -22,10 +22,10 @@ const { createDispatcher } = require('./lib/handlers/dispatcher');
 const { createChannelsToolDispatcher } = require('./lib/process/channels-tool-dispatcher');
 const { chunkMarkdownText } = require('./lib/delivery/chunk');
 const { toWhatsApp } = require('./lib/delivery/format');
-const { createTmuxRunner } = require('./lib/tmux/tmux-runner');
-const { createProcessFactory } = require('./lib/process/factory');
-const { ProcessManager } = require('./lib/process/process-manager');
-const { ensureVendoredClaudeBin, CLAUDE_CLI_PINNED_VERSION } = require('./lib/claude-bin');
+const { WATER_DISPLAY_HINT } = require('./lib/delivery/display-hint');
+// The Claude session engine — extracted shared library (docs/SHARED-LIB.md).
+const { createTmuxRunner, createProcessFactory, ProcessManager, claudeBin } = require('@shumkov/orchestra');
+const { ensureVendoredClaudeBin, CLAUDE_CLI_PINNED_VERSION } = claudeBin;
 const { classify } = require('./lib/error/classify');
 const { createEscalator } = require('./lib/ops/escalate');
 const { createSlaWatchdog } = require('./lib/ops/sla-watchdog');
@@ -67,6 +67,8 @@ function createDaemon({ config, account, dataDir, logger = console, transport: i
   const factory = createProcessFactory({
     config: { chats: scoped.chats, bot: { pm: 'cli' } },
     tmuxRunner, botName: account, toolDispatcher, channelsClaudeBin: vendored.path, db, logger,
+    displayHint: WATER_DISPLAY_HINT,                         // orchestra: WhatsApp rendering rules
+    maxOutboundFileBytes: (acc.mediaMaxMb || 100) * 1024 * 1024,
   });
   const pm = new ProcessManager({ processFactory: factory, budget: acc.processBudget || 9, logger });
 
