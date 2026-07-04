@@ -27,6 +27,11 @@ const { createProcessFactory } = require('./lib/process/factory');
 const { ProcessManager } = require('./lib/process/process-manager');
 const { ensureVendoredClaudeBin, CLAUDE_CLI_PINNED_VERSION } = require('./lib/claude-bin');
 const { classify } = require('./lib/error/classify');
+const { createEscalator } = require('./lib/ops/escalate');
+const { createSlaWatchdog } = require('./lib/ops/sla-watchdog');
+const { createTransportWatchdog } = require('./lib/ops/transport-watchdog');
+const { createHeartbeat } = require('./lib/ops/heartbeat');
+const ipcServer = require('./lib/ipc/server');
 
 // Assemble a daemon for one account. Returns { start, stop } so tests can drive it
 // with injected transport/logger without opening real sockets.
@@ -90,6 +95,27 @@ function createDaemon({ config, account, dataDir, logger = console, transport: i
     deliverFallback, errorReply, classify, attachmentsFor, logEvent, logger,
   });
 
+  // Ops: escalation (-> polygram IPC -> Telegram), SLA + transport watchdogs, heartbeat.
+  const esc = acc.escalation || {};
+  const escalator = createEscalator({ ipcBot: esc.ipcBot, chatId: esc.chatId, quietHours: esc.quietHours, logEvent, logger });
+  const heartbeat = createHeartbeat({ db, dataDir, account });
+  function holdingText(chatJid) {
+    const chat = resolve(chatJid) || {};
+    const hr = chat.holdingReply || acc.holdingReply || {};
+    return hr.en || hr.th || Object.values(hr)[0] || 'Hi! We are on it — a human will follow up shortly.';
+  }
+  const sla = createSlaWatchdog({
+    db, resolveChat: resolve, defaults: scoped.defaults, slaMinutes: esc.slaMinutes || 10,
+    escalate: (sev, t) => escalator.escalate(sev, t),
+    sendHolding: async (row) => {
+      const r = await toolDispatcher({ sessionKey: row.chat_jid, chatId: row.chat_jid, toolName: 'reply', text: holdingText(row.chat_jid) });
+      return r.ok;
+    },
+    logEvent, logger,
+  });
+  const expectedWebhook = { url: `${acc.wuzapi.baseUrl.includes('127.0.0.1') ? '' : ''}http://127.0.0.1:${acc.webhook.port}/hook/${acc.webhook?.pathToken || 'water'}`, events: undefined, baseUrlPrefix: 'http://127.0.0.1' };
+  const transportWatchdog = createTransportWatchdog({ transport, escalate: (sev, t) => escalator.escalate(sev, t), expectedWebhook, logEvent, logger });
+
   // Route one recorded inbound through the gate. Fire-and-forget from onMessage so the
   // webhook acks fast; a turn runs in the background.
   async function processInbound(msg, rowId) {
@@ -121,8 +147,19 @@ function createDaemon({ config, account, dataDir, logger = console, transport: i
   }
 
   async function onConnectionEvent(ev) {
-    logEvent('connection', { kind: ev.kind });
-    // full transport-watchdog handling (revive, escalation) lands in 1b-D.
+    await transportWatchdog.onConnectionEvent(ev);
+  }
+
+  // IPC-injected synthetic turn (cron jobs) — runs through the normal pipeline.
+  async function injectTurn({ chat_id, text, source = 'cron' }) {
+    const synthetic = {
+      chatJid: chat_id, chatType: chat_id.endsWith('@g.us') ? 'group' : 'dm', msgId: `inj-${Date.now()}`,
+      sender: { jid: 'water:inject', altJid: null, pushName: source, pn: null, lid: null },
+      isFromMe: false, tsMs: Date.now(), receivedAtMs: Date.now(), text, mentions: [], attachments: [],
+    };
+    const rec = recordInbound(synthetic, { account, source: `cron:${source}` });
+    if (rec.rowId && !rec.deduped) await dispatcher.dispatch(chat_id, synthetic, { id: rec.rowId });
+    return { ok: true };
   }
 
   // Learn the bot's own identity set for mention gating.
@@ -162,30 +199,60 @@ function createDaemon({ config, account, dataDir, logger = console, transport: i
   }
 
   let receiver = null;
-  async function start() {
+  let ipc = null;
+  let slaTimer = null;
+  let pollTimer = null;
+  async function start({ withTimers = true } = {}) {
     await learnIdentity();
     const pathToken = acc.webhook?.pathToken || 'water';
+    heartbeat.start();
     receiver = createReceiver({
       port: acc.webhook.port, pathToken, hmacKey: acc.wuzapi.hmacKey || '',
-      healthPayload: () => ({ heartbeatAgeS: 0, pending: 0 }),
+      healthPayload: () => heartbeat.healthPayload(),
       emit: logEvent, logger,
       handlers: { onMessage, onConnectionEvent },
     });
     const addr = await receiver.listen();
     logger.log?.(`[water] account=${account} webhook on ${addr.address}:${addr.port}/hook/${pathToken}`);
+
+    // water's own IPC socket (cron injectTurn, operator sends). Allowlisted ops.
+    try {
+      const secret = ipcServer.writeSecret(account);
+      ipc = ipcServer.start({
+        path: ipcServer.socketPathFor(account),
+        secret,
+        logger,
+        handlers: {
+          ping: async () => ({ pong: true }),
+          injectTurn: async (p) => injectTurn(p),
+          sendText: async (p) => toolDispatcher({ sessionKey: p.chat_id, chatId: p.chat_id, toolName: 'reply', text: p.text }),
+        },
+      });
+    } catch (e) { logger.warn?.('ipc start failed', e?.message); }
+
     await bootReplay();
+
+    if (withTimers) {
+      slaTimer = setInterval(() => sla.tick().catch((e) => logger.error?.('sla', e?.message)), 30_000); slaTimer.unref?.();
+      pollTimer = setInterval(() => transportWatchdog.poll().catch((e) => logger.error?.('poll', e?.message)), 60_000); pollTimer.unref?.();
+    }
     return { port: addr.port };
   }
 
   async function stop() {
+    if (slaTimer) clearInterval(slaTimer);
+    if (pollTimer) clearInterval(pollTimer);
+    heartbeat.stop();
     if (receiver) await receiver.close();
+    try { ipc?.close?.(); } catch { /* */ }
     status.markInFlightForShutdown();
     db.prepare("INSERT OR REPLACE INTO daemon_state (k,v) VALUES ('clean_shutdown_at', ?)").run(String(Date.now()));
     try { await pm.shutdown?.(); } catch { /* */ }
     db.close();
   }
 
-  return { start, stop, db, pm, gate, dispatcher, onMessage, processInbound, _internal: { transport, outbound, jidMap, sessions, status, toolDispatcher, botIdentity } };
+  return { start, stop, db, pm, gate, dispatcher, onMessage, processInbound, injectTurn,
+    _internal: { transport, outbound, jidMap, sessions, status, toolDispatcher, botIdentity, escalator, sla, transportWatchdog, heartbeat } };
 }
 
 // CLI entry
