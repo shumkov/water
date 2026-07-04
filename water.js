@@ -63,12 +63,20 @@ function createDaemon({ config, account, dataDir, logger = console, transport: i
   // Session engine: pinned+vendored claude, tmux, cli backend.
   const vendored = ensureVendoredClaudeBin(CLAUDE_CLI_PINNED_VERSION);
   if (!vendored.ok) throw new Error(`water: claude binary unavailable: ${vendored.reason}`);
-  const tmuxRunner = createTmuxRunner({ logger });
+  const tmuxRunner = createTmuxRunner({ logger, sessionPrefix: 'water' });
   const factory = createProcessFactory({
     config: { chats: scoped.chats, bot: { pm: 'cli' } },
     tmuxRunner, botName: account, toolDispatcher, channelsClaudeBin: vendored.path, db, logger,
     displayHint: WATER_DISPLAY_HINT,                         // orchestra: WhatsApp rendering rules
     maxOutboundFileBytes: (acc.mediaMaxMb || 100) * 1024 * 1024,
+    // orchestra identity — water's names so the shared engine speaks WhatsApp.
+    sessionPrefix: 'water',
+    bridgeServerName: 'water-bridge',
+    appDataDir: path.join(require('node:os').homedir(), '.water'),
+    attachmentBase: '/tmp/water-attachments',
+    productName: 'water',
+    surfaceName: 'WhatsApp',
+    pmDefault: 'cli',
   });
   const pm = new ProcessManager({ processFactory: factory, budget: acc.processBudget || 9, logger });
 

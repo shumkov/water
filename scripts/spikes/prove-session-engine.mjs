@@ -28,7 +28,7 @@ if (!vendored.ok) { console.error(`[prove] cannot vendor claude: ${vendored.reas
 const claudeBinPath = vendored.path;
 console.log(`[prove] claude=${claudeBinPath}\n[prove] nonce=${NONCE} chat=${CHAT_JID}\n[prove] cwd=${cwd}`);
 
-const tmuxRunner = createTmuxRunner({ logger: console });
+const tmuxRunner = createTmuxRunner({ logger: console, sessionPrefix: 'water' });
 
 let replyText = null;
 let replyChat = null;
@@ -41,6 +41,8 @@ const toolDispatcher = async ({ toolName, text, chatId }) => {
 const proc = new CliProcess({
   sessionKey: SESSION_KEY, chatId: CHAT_JID, threadId: null, label: 'prove',
   tmuxRunner, botName: 'water-prove', claudeBin: claudeBinPath, toolDispatcher, displayHint: '', logger: console,
+  // water's identity — proves the parameterized engine uses water's names end to end.
+  sessionPrefix: 'water', bridgeServerName: 'water-bridge', productName: 'water', surfaceName: 'WhatsApp',
 });
 
 proc.on('init', (i) => console.log(`[prove] init session=${i.session_id}`));
