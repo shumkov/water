@@ -1,8 +1,12 @@
 {
   "accounts": {
     "umi": {
-      "wuzapi": { "baseUrl": "http://127.0.0.1:8099" },
-      "webhook": { "port": 8090 },
+      "wuzapi": {
+        "baseUrl": "http://127.0.0.1:8099",
+        "userToken": "<wuzapi-user-token>",
+        "hmacKey": "<shared-webhook-hmac-secret>"
+      },
+      "webhook": { "port": 8090, "pathToken": "water" },
       "dmPolicy": "allowlist",
       "groupPolicy": "allowlist",
       "adminJids": ["<ivan-pn>@s.whatsapp.net", "<ivan-lid>@lid"],
