@@ -159,3 +159,21 @@ test('every synthetic Message fixture yields a msgId, chatJid and terminal type'
     }
   }
 });
+
+test('edit that ADDS an @mention re-extracts mentions from the edited inner (not the wrapper)', () => {
+  const raw = {
+    type: 'Message',
+    event: {
+      Info: { ID: 'EDITEVT', Chat: '120363@g.us', Sender: '999@s.whatsapp.net', IsFromMe: false, Timestamp: '2026-07-05T12:00:00Z', PushName: 'P' },
+      Message: { protocolMessage: {
+        type: 14, key: { ID: 'ORIG1' },
+        editedMessage: { extendedTextMessage: { text: 'order please @UMI', contextInfo: { mentionedJID: ['150689682575440@lid'] } } },
+      } },
+    },
+  };
+  const r = normalize(raw);
+  assert.equal(r.type, 'message');
+  assert.equal(r.message.edit.targetMsgId, 'ORIG1');
+  assert.equal(r.message.text, 'order please @UMI');
+  assert.deepEqual(r.message.mentions, ['150689682575440@lid']); // the added mention is visible to the gate
+});

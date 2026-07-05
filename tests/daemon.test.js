@@ -228,3 +228,51 @@ test('a bot reply through the tool-dispatcher stores an outbound ts in ms (SLA g
   assert.ok(outTs > 1e12, `outbound ts must be ms scale, got ${outTs}`);
   await d.stop();
 });
+
+test('edit that ADDS a mention to an ignored message dispatches a turn (WhatsApp patch #9)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-edit1-'));
+  const d = daemon(dir, []);
+  let dispatched = 0;
+  d.pm.getOrSpawn = async () => {};
+  d.pm.procs = new Map([[GROUP, { claudeSessionId: 'sess-1' }]]);
+  d.pm.send = async () => { dispatched++; return { alreadyDelivered: true, turnId: 'T', metrics: { resultSubtype: 'success' } }; };
+  // 1. no mention → ignored, no turn
+  await d.onMessage(msg({ msgId: 'M1', text: 'order please' }));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(dispatched, 0, 'unaddressed → not dispatched');
+  assert.equal(d.db.prepare("SELECT handler_status FROM messages WHERE msg_id='M1'").get().handler_status, 'ignored');
+  // 2. partner EDITS M1 to add the mention → now it earns a reply
+  await d.onMessage(msg({ msgId: 'EDIT1', edit: { targetMsgId: 'M1' }, text: 'order please umi' }));
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(dispatched, 1, 'edit added the mention → dispatched a turn');
+  await d.stop();
+});
+
+test('edit that does NOT newly address the bot stays silent (text-only update)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-edit2-'));
+  const d = daemon(dir, []);
+  let dispatched = 0;
+  d.pm.getOrSpawn = async () => {}; d.pm.procs = new Map();
+  d.pm.send = async () => { dispatched++; return { alreadyDelivered: true }; };
+  await d.onMessage(msg({ msgId: 'M2', text: 'order please' }));
+  await d.onMessage(msg({ msgId: 'E2', edit: { targetMsgId: 'M2' }, text: 'order please now' })); // still no mention
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(dispatched, 0, 'edit without a mention → no dispatch');
+  await d.stop();
+});
+
+test('edit while a turn is in flight folds a correction into the live turn (no competing turn)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-edit3-'));
+  const d = daemon(dir, []);
+  let dispatched = 0; let injected = null;
+  d.pm.getOrSpawn = async () => {};
+  d.pm.procs = new Map([[GROUP, { inFlight: true, injectUserMessage: (a) => { injected = a; return true; } }]]);
+  d.pm.send = async () => { dispatched++; return { alreadyDelivered: true }; };
+  await d.onMessage(msg({ msgId: 'M3', text: 'order please' }));            // ignored
+  await d.onMessage(msg({ msgId: 'E3', edit: { targetMsgId: 'M3' }, text: 'order please umi' })); // edit adds mention, mid-turn
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(dispatched, 0, 'in-flight turn → no competing dispatch');
+  assert.ok(injected && /order please umi/.test(injected.content), 'correction folded into the live turn');
+  assert.equal(injected.source, 'edit-fold');
+  await d.stop();
+});

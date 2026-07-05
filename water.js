@@ -184,15 +184,41 @@ function createDaemon({ config, account, dataDir, logger = console, transport: i
       }
       return;
     }
-    // Inbound edit: update the ORIGINAL message's text + edited_ts in place (v1 —
-    // edit-correction injection is roadmap); don't create a second row keyed on the
-    // edit's own id (SPEC §4.1).
+    // Inbound edit: update the ORIGINAL message's text/mentions in place (don't create a
+    // second row keyed on the edit's own id), then RE-EVALUATE the edited content — an
+    // edit can newly address the bot (added @mention / reply) or correct a message
+    // mid-turn.
     if (msg.edit?.targetMsgId) {
+      const target = msg.edit.targetMsgId;
       try {
         db.prepare('UPDATE messages SET text=@text, edited_ts=@ts WHERE chat_jid=@chat AND msg_id=@target')
-          .run({ text: msg.text ?? null, ts: msg.tsMs, chat: msg.chatJid, target: msg.edit.targetMsgId });
+          .run({ text: msg.text ?? null, ts: msg.tsMs, chat: msg.chatJid, target });
       } catch (e) { logger.error?.('record edit', e?.message); }
-      logEvent('inbound-edit', { chatJid: msg.chatJid, target: msg.edit.targetMsgId });
+      logEvent('inbound-edit', { chatJid: msg.chatJid, target });
+
+      // Gate the edited content under the ORIGINAL message id (normalize re-extracted its
+      // mentions/quote from the edited payload).
+      const edited = { ...msg, msgId: target, edit: undefined };
+      if (gate.decide(edited).action !== 'dispatch') return;   // still unaddressed → text-only
+
+      const proc = pm.get?.(msg.chatJid);
+      // Turn in flight → fold the correction in (like polygram's edit-correction),
+      // rather than starting a competing turn.
+      if (proc?.inFlight && proc.injectUserMessage) {
+        const ok = proc.injectUserMessage({
+          content: `[edit] The user edited an earlier message — it now reads: ${msg.text ?? ''}`,
+          priority: 'next', msgId: target, source: 'edit-fold',
+        });
+        if (ok) { logEvent('edit-injected', { chatJid: msg.chatJid, target }); return; }
+      }
+      // No live turn: an edit that added the mention to a not-yet-answered message earns a
+      // reply now (WhatsApp linked-device patch #9). Skip if it was already answered.
+      if (status.hasCompletedTurn(msg.chatJid, target)) return;
+      const row = db.prepare("SELECT id FROM messages WHERE chat_jid=? AND msg_id=? AND direction='in' ORDER BY id DESC LIMIT 1").get(msg.chatJid, target);
+      if (row) {
+        logEvent('edit-redispatch', { chatJid: msg.chatJid, target });
+        dispatcher.dispatch(msg.chatJid, edited, { id: row.id }).catch((e) => logger.error?.('dispatch(edit)', e?.message));
+      }
       return;
     }
     const rec = recordInbound(msg, { account }); // throws on DB failure -> 500 -> wuzapi retries
