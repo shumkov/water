@@ -35,7 +35,7 @@ const ipcServer = require('./lib/ipc/server');
 
 // Assemble a daemon for one account. Returns { start, stop } so tests can drive it
 // with injected transport/logger without opening real sockets.
-function createDaemon({ config, account, dataDir, logger = console, transport: injectedTransport, botIdentity: injectedBotIdentity } = {}) {
+function createDaemon({ config, account, dataDir, standby = false, logger = console, transport: injectedTransport, botIdentity: injectedBotIdentity } = {}) {
   const scoped = scopeToAccount(config, account);
   const acc = scoped.accountConfig;
   const dbPath = path.join(dataDir, `${account}.db`);
@@ -148,7 +148,8 @@ function createDaemon({ config, account, dataDir, logger = console, transport: i
     logEvent, logger,
   });
   const expectedWebhook = { url: `${acc.wuzapi.baseUrl.includes('127.0.0.1') ? '' : ''}http://127.0.0.1:${acc.webhook.port}/hook/${acc.webhook?.pathToken || 'water'}`, events: undefined, baseUrlPrefix: 'http://127.0.0.1' };
-  const transportWatchdog = createTransportWatchdog({ transport, escalate: (sev, t) => escalator.escalate(sev, t), expectedWebhook, logEvent, logger });
+  const transportWatchdog = createTransportWatchdog({ transport, escalate: (sev, t) => escalator.escalate(sev, t), expectedWebhook, logEvent, logger, standby });
+  if (standby) logger.log?.(`[water] STANDBY — connected + listening, NOT claiming the WuzAPI webhook (pre-flight)`);
 
   // Route one recorded inbound through the gate. Fire-and-forget from onMessage so the
   // webhook acks fast; a turn runs in the background.
@@ -372,11 +373,12 @@ function createDaemon({ config, account, dataDir, logger = console, transport: i
 
 // CLI entry
 function parseArgs(argv) {
-  const a = { account: null, config: null, dataDir: process.cwd() };
+  const a = { account: null, config: null, dataDir: process.cwd(), standby: false };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--account') a.account = argv[++i];
     else if (argv[i] === '--config') a.config = argv[++i];
     else if (argv[i] === '--data-dir') a.dataDir = argv[++i];
+    else if (argv[i] === '--standby') a.standby = true;   // pre-flight: don't claim the webhook
   }
   return a;
 }
@@ -386,7 +388,7 @@ async function main() {
   if (!args.account) { console.error('water: --account <name> required'); process.exit(2); }
   const configPath = args.config || path.join(args.dataDir, 'config.json');
   const config = loadConfig(configPath);
-  const daemon = createDaemon({ config, account: args.account, dataDir: args.dataDir });
+  const daemon = createDaemon({ config, account: args.account, dataDir: args.dataDir, standby: args.standby });
   const shutdown = async (sig) => { console.log(`[water] ${sig} — shutting down`); try { await daemon.stop(); } finally { process.exit(0); } };
   for (const s of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(s, () => shutdown(s));
   await daemon.start();

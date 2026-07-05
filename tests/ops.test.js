@@ -111,3 +111,18 @@ test('heartbeat writes an atomic file and reports fresh age', () => {
   assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'heartbeat.json'))).account, 'umi');
   assert.ok(hb.healthPayload().heartbeatAgeS <= 1);
 });
+
+test('transport watchdog in STANDBY does not claim the webhook', async () => {
+  const { createTransportWatchdog } = require('../lib/ops/transport-watchdog');
+  let setCalls = 0;
+  const transport = { async sessionStatus() { return { connected: true, webhook: '' }; }, async setWebhook() { setCalls++; } };
+  const wd = createTransportWatchdog({ transport, escalate: async () => {}, expectedWebhook: { url: 'http://127.0.0.1:8090/hook/water', baseUrlPrefix: 'http://127.0.0.1' }, standby: true });
+  await wd.poll();
+  assert.equal(setCalls, 0, 'standby must NOT claim an empty webhook');
+  // and NON-standby DOES claim it
+  let setCalls2 = 0;
+  const t2 = { async sessionStatus() { return { connected: true, webhook: '' }; }, async setWebhook() { setCalls2++; } };
+  const wd2 = createTransportWatchdog({ transport: t2, escalate: async () => {}, expectedWebhook: { url: 'http://127.0.0.1:8090/hook/water', baseUrlPrefix: 'http://127.0.0.1' } });
+  await wd2.poll();
+  assert.equal(setCalls2, 1, 'non-standby claims the empty webhook');
+});
