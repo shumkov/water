@@ -129,3 +129,25 @@ test('connection event routes to onConnectionEvent', async () => {
   assert.equal(r.status, 200);
   assert.equal(seen.connections.at(-1).kind, 'disconnected');
 });
+
+test('skipHmac (loopback-trust) accepts an UNSIGNED webhook — no 401', async () => {
+  const s = { messages: [] };
+  const r2 = createReceiver({
+    port: 0, pathToken: 'lt', hmacKey: '', skipHmac: true,
+    healthPayload: () => ({ heartbeatAgeS: 1 }),
+    handlers: { onMessage: async (m) => s.messages.push(m) },
+  });
+  const addr = await r2.listen();
+  const b = `http://127.0.0.1:${addr.port}`;
+  const raw = JSON.stringify({ type: 'Message', event: { Info: { ID: 'X', Chat: '1@g.us', Sender: '2@s.whatsapp.net', IsFromMe: false, Timestamp: '2026-07-05T00:00:00Z' }, Message: { conversation: 'hi' } } });
+  const res = await fetch(b + '/hook/lt', { method: 'POST', headers: { 'content-type': 'application/json' }, body: raw });
+  assert.equal(res.status, 200, 'unsigned webhook accepted under loopback-trust');
+  assert.equal(s.messages.length, 1);
+  await r2.close();
+});
+
+test('boot fails loud when requireHmac and no key (water.js assert path)', () => {
+  // mirrors water.js: requireHmac (default) + empty key must throw, never silently skip.
+  const requireHmac = true; const hmacKey = '';
+  assert.throws(() => { if (requireHmac && !hmacKey) throw new Error('no wuzapi.hmacKey configured'); }, /hmacKey/);
+});

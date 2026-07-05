@@ -310,9 +310,19 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
   async function start({ withTimers = true } = {}) {
     await learnIdentity();
     const pathToken = acc.webhook?.pathToken || 'water';
+    // HMAC posture (fail-loud): require a signed webhook UNLESS explicitly opted out with
+    // webhook.requireHmac:false (loopback-trust — the receiver binds 127.0.0.1 only). Never
+    // a silent skip: a missing key with requireHmac still on aborts the boot.
+    const hmacKey = acc.wuzapi.hmacKey || '';
+    const requireHmac = acc.webhook?.requireHmac !== false;
+    if (requireHmac && !hmacKey) {
+      throw new Error('water: no wuzapi.hmacKey configured. Set the shared HMAC secret, or set webhook.requireHmac:false to trust the loopback bind (unsigned webhooks).');
+    }
+    const skipHmac = !requireHmac && !hmacKey;
+    if (skipHmac) logger.warn?.('[water] HMAC DISABLED (webhook.requireHmac:false) — the webhook trusts the 127.0.0.1 bind only');
     heartbeat.start();
     receiver = createReceiver({
-      port: acc.webhook.port, pathToken, hmacKey: acc.wuzapi.hmacKey || '',
+      port: acc.webhook.port, pathToken, hmacKey, skipHmac,
       healthPayload: () => heartbeat.healthPayload(),
       emit: logEvent, logger,
       handlers: { onMessage, onConnectionEvent },
