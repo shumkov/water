@@ -177,3 +177,43 @@ test('edit that ADDS an @mention re-extracts mentions from the edited inner (not
   assert.equal(r.message.text, 'order please @UMI');
   assert.deepEqual(r.message.mentions, ['150689682575440@lid']); // the added mention is visible to the gate
 });
+
+// Regression: whatsmeow attaches a senderKeyDistributionMessage (group-encryption key setup)
+// to the first message from a sender / after a key rotation, and can split it into its OWN
+// webhook event that carries the SAME message ID as the real message but no content. If
+// normalize returns it as a 'message', water records the empty copy and the dedup then DROPS
+// the real same-id copy — a silent partner-message loss (observed: a reply-to-bot "recalculate"
+// ignored). It must be classified as a skippable (non-message) type.
+const _info = (id) => ({ Chat: '120363419377779909@g.us', Sender: '228234595721420:13@lid', ID: id, IsGroup: true, Timestamp: '2026-07-06T02:41:30-03:00', PushName: 'Ivan Shumkov' });
+
+test('senderKeyDistributionMessage-only payload is NOT a message (skipped so the real same-id copy survives)', () => {
+  const skdm = { type: 'Message', event: { Info: _info('3BF1AB11'), Message: {
+    senderKeyDistributionMessage: { groupID: '120363419377779909@g.us', axolotlSenderKeyDistributionMessage: 'Mwio…' },
+    messageContextInfo: { deviceListMetadataVersion: 2 },
+  } } };
+  const r = normalize(skdm);
+  assert.notEqual(r.type, 'message', 'a key-distribution-only copy must not route to onMessage');
+  assert.equal(r.ignored, true);
+});
+
+test('the real same-id copy (extendedText reply-to-bot) normalizes to a message with text + quote', () => {
+  const real = { type: 'Message', event: { Info: _info('3BF1AB11'), Message: {
+    extendedTextMessage: { text: 'recalculate', contextInfo: { stanzaID: '3EB0E806', participant: '150689682575440@lid', quotedMessage: { conversation: '📊 Commission Report' } } },
+    messageContextInfo: { messageSecret: 'x' },
+  } } };
+  const r = normalize(real);
+  assert.equal(r.type, 'message');
+  assert.equal(r.message.text, 'recalculate');
+  assert.equal(r.message.quote.msgId, '3EB0E806');
+  assert.equal(r.message.quote.participantJid, '150689682575440@lid');
+});
+
+test('a real message carrying the sender key INLINE (bundled) is still processed, not skipped', () => {
+  const bundled = { type: 'Message', event: { Info: _info('3BF1AB12'), Message: {
+    senderKeyDistributionMessage: { groupID: '120363419377779909@g.us', axolotlSenderKeyDistributionMessage: 'Mwio…' },
+    extendedTextMessage: { text: '@UMI hi' },
+  } } };
+  const r = normalize(bundled);
+  assert.equal(r.type, 'message');
+  assert.equal(r.message.text, '@UMI hi');
+});
