@@ -37,9 +37,15 @@ const ipcServer = require('./lib/ipc/server');
 // webhook it must not clobber. Defaults to the loopback bind; webhook.advertiseHost lets a
 // Docker-networked deployment advertise a bridge-gateway address the WuzAPI container can
 // actually reach — water on the host is NOT reachable at the container's own 127.0.0.1.
-function buildExpectedWebhook({ port, pathToken = 'water', advertiseHost = '127.0.0.1' } = {}) {
-  const base = `http://${advertiseHost}`;
-  return { url: `${base}:${port}/hook/${pathToken}`, events: undefined, baseUrlPrefix: base };
+function buildExpectedWebhook({ port, pathToken, advertiseHost } = {}) {
+  // Coalesce on falsy (not just undefined) so an explicit "" can never diverge from the
+  // receiver, which resolves the same values with `|| 'water'` / `|| '127.0.0.1'`.
+  const host = advertiseHost || '127.0.0.1';
+  const token = pathToken || 'water';
+  const base = `http://${host}`;
+  // `path` lets the watchdog recognise OUR webhook by path (/hook/<token>) across an
+  // advertiseHost change, instead of by host — so a host change self-heals, not dead-locks.
+  return { url: `${base}:${port}/hook/${token}`, path: `/hook/${token}`, events: undefined, baseUrlPrefix: base };
 }
 
 // Assemble a daemon for one account. Returns { start, stop } so tests can drive it
@@ -329,7 +335,12 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
       throw new Error('water: no wuzapi.hmacKey configured. Set the shared HMAC secret, or set webhook.requireHmac:false to trust the bind host + firewall (unsigned webhooks).');
     }
     const skipHmac = !requireHmac && !hmacKey;
-    if (skipHmac) logger.warn?.(`[water] HMAC DISABLED (webhook.requireHmac:false) — unsigned webhooks trusted; the boundary is the ${bindHost} bind + host firewall`);
+    if (skipHmac) {
+      const wildcard = bindHost === '0.0.0.0' || bindHost === '::';
+      logger.warn?.(`[water] HMAC DISABLED (webhook.requireHmac:false) — unsigned webhooks trusted; ${wildcard
+        ? `bind is ${bindHost} (ALL interfaces) — the ONLY boundary is the host firewall`
+        : `the boundary is the ${bindHost} bind + host firewall`}`);
+    }
     heartbeat.start();
     receiver = createReceiver({
       port: acc.webhook.port, host: bindHost, pathToken, hmacKey, skipHmac,

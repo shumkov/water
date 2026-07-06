@@ -287,12 +287,21 @@ test('buildExpectedWebhook advertises webhook.advertiseHost (not a hardcoded 127
   const def = buildExpectedWebhook({ port: 8090, pathToken: 'water' });
   assert.equal(def.url, 'http://127.0.0.1:8090/hook/water');
   assert.equal(def.baseUrlPrefix, 'http://127.0.0.1');
+  assert.equal(def.path, '/hook/water');
 
-  // Cross-namespace: the advertised URL + drift-detection prefix follow advertiseHost.
+  // Cross-namespace: the advertised URL + drift-detection prefix follow advertiseHost;
+  // path stays host-agnostic so the watchdog recognises our webhook across a host change.
   const gw = buildExpectedWebhook({ port: 8090, pathToken: 'water', advertiseHost: '172.21.0.1' });
   assert.equal(gw.url, 'http://172.21.0.1:8090/hook/water');
   assert.equal(gw.baseUrlPrefix, 'http://172.21.0.1');
+  assert.equal(gw.path, '/hook/water');
 
   // pathToken defaults to 'water'.
   assert.equal(buildExpectedWebhook({ port: 9, advertiseHost: '10.0.0.5' }).url, 'http://10.0.0.5:9/hook/water');
+
+  // Coalesce on falsy: an explicit "" must fall back to the defaults, matching how the
+  // receiver resolves the same values — otherwise the advertised URL and the bind diverge.
+  const empty = buildExpectedWebhook({ port: 8090, pathToken: '', advertiseHost: '' });
+  assert.equal(empty.url, 'http://127.0.0.1:8090/hook/water');
+  assert.equal(empty.path, '/hook/water');
 });

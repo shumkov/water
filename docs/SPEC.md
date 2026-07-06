@@ -210,7 +210,12 @@ notes (ogg/opus, usually <1 MB) download post-gate and transcribe (Whisper, prov
 per config) inline. Failed/expired downloads surface as `<attachment-failed>`;
 `/chat/request-unavailable-message` retry is roadmap.
 
-**Webhook receiver:** loopback HTTP (`127.0.0.1:8090`, path `/hook/<random-token>`),
+**Webhook receiver:** HTTP on `<bindHost>:8090`, path `/hook/<random-token>` — loopback
+(`127.0.0.1`) by default. `webhook.bindHost`/`webhook.advertiseHost` make it configurable for
+deployments where WuzAPI and water do NOT share a network namespace (e.g. WuzAPI in Docker,
+water on the host): bind a wider interface and advertise the docker-bridge gateway, then scope
+the port with a firewall rule. water re-advertises on boot; the watchdog recognises its own
+webhook by path, so a host change self-heals.
 `WEBHOOK_FORMAT=json` mandated. Per delivery: read body (sanity cap 8 MB — far above
 any -skipmedia payload; over-cap → 413 + `webhook-anomaly` event, safe because
 legitimate deliveries cannot approach it), verify `x-hmac-signature` (HMAC-SHA256
@@ -711,8 +716,10 @@ shared VPS, WhatsApp platform risk. **Honest boundary statement:**
   (the injection must defeat the agent, not the framing), allowlist gates limiting
   who can talk at all, and the transcript/events audit trail. Per-chat UID isolation
   / token brokering → §17.
-- Loopback-only surfaces: wuzapi API, water webhook receiver (+ HMAC + path token),
-  water IPC socket (0600 + per-boot secret). UFW stays 22/80/443.
+- Loopback-only surfaces by default: wuzapi API, water webhook receiver (+ HMAC + path token),
+  water IPC socket (0600 + per-boot secret). UFW: 22/80/443 — plus a source-scoped rule for the
+  webhook port when water binds beyond loopback for a Docker-networked WuzAPI (allow only the
+  docker-bridge subnet; public stays denied).
 - **wuzapi's data volume is credential material** (whatsmeow device session = full
   WhatsApp account takeover; user tokens plaintext; `GLOBAL_ENCRYPTION_KEY` protects
   neither): volume dir 0700 `shumabit:shumabit`, excluded from world-readable
@@ -752,7 +759,8 @@ shared VPS, WhatsApp platform risk. **Honest boundary statement:**
 - **Resource budget** (24 GB box, ~17 GB free today): water ~100 MB; cli claude
   ~550 MB each, budget 9 → 3 warm ≈ 1.7 GB; wuzapi ~150 MB. Peak = parallel-run
   (Baileys + water pool) ≈ +2.5 GB — comfortable; revisit if group count grows.
-- Ports added: 8090 water webhook (loopback), 8099 wuzapi (reuse of spike port).
+- Ports added: 8090 water webhook (loopback by default; bridge-scoped when WuzAPI is dockerized),
+  8099 wuzapi (reuse of spike port).
 
 ## 12. Configuration
 
