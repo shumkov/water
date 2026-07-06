@@ -78,6 +78,18 @@ Then create a user and link your WhatsApp (via WuzAPI's admin API or its web UI 
    (host/port/path must match `webhook.port` + `webhook.pathToken` below). Set the shared
    **HMAC secret** WuzAPI signs with to the same value as water's `wuzapi.hmacKey`.
 
+> **WuzAPI-in-Docker → water-on-host: don't use `127.0.0.1` in the webhook URL.** WuzAPI
+> posts the webhook from *inside* its container, where `127.0.0.1` is the container's own
+> loopback — not the host. If water runs on the host, `http://127.0.0.1:8090` is unreachable
+> and **every message is silently dropped** (WuzAPI logs `connection refused` and dead-letters
+> it). Instead bind water where the container can reach it and advertise that address: set
+> `webhook.bindHost` to `0.0.0.0` and `webhook.advertiseHost` to the docker-bridge gateway
+> (find it with `docker network inspect <net> -f '{{(index .IPAM.Config 0).Gateway}}'`, e.g.
+> `172.21.0.1`), and use that same host in the webhook URL above. **Pin the network's
+> subnet/gateway** (compose `ipam.config`) so the gateway IP is stable, and **firewall the
+> port** so only the bridge subnet reaches it. When WuzAPI and water share a network namespace
+> (host networking, or both in the same compose), the `127.0.0.1` defaults are correct.
+
 See [`docs/wuzapi-contract.md`](docs/wuzapi-contract.md) for the exact endpoints/fields.
 
 ### 2. water
@@ -104,7 +116,8 @@ Copy [`config.example.json`](config.example.json) and edit. Shape:
         "userToken": "<wuzapi-user-token>",    // from step 1.1 — sent as the `token` header
         "hmacKey": "<shared-webhook-hmac-secret>"  // MUST equal WuzAPI's webhook secret
       },
-      "webhook": { "port": 8090, "pathToken": "water" },  // water listens on /hook/<pathToken>
+      "webhook": { "port": 8090, "pathToken": "water" },  // listens on <bindHost>:<port>/hook/<pathToken>
+                                                          // + "bindHost"/"advertiseHost" if WuzAPI is dockerized (see step 3 note)
       "dmPolicy": "allowlist",                 // fail-closed: only configured chats are served
       "groupPolicy": "allowlist",
       "adminJids": ["<your-pn>@s.whatsapp.net", "<your-lid>@lid"],

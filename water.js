@@ -33,6 +33,15 @@ const { createTransportWatchdog } = require('./lib/ops/transport-watchdog');
 const { createHeartbeat } = require('./lib/ops/heartbeat');
 const ipcServer = require('./lib/ipc/server');
 
+// The webhook URL water registers with WuzAPI, plus the prefix used to recognise a "foreign"
+// webhook it must not clobber. Defaults to the loopback bind; webhook.advertiseHost lets a
+// Docker-networked deployment advertise a bridge-gateway address the WuzAPI container can
+// actually reach — water on the host is NOT reachable at the container's own 127.0.0.1.
+function buildExpectedWebhook({ port, pathToken = 'water', advertiseHost = '127.0.0.1' } = {}) {
+  const base = `http://${advertiseHost}`;
+  return { url: `${base}:${port}/hook/${pathToken}`, events: undefined, baseUrlPrefix: base };
+}
+
 // Assemble a daemon for one account. Returns { start, stop } so tests can drive it
 // with injected transport/logger without opening real sockets.
 function createDaemon({ config, account, dataDir, standby = false, logger = console, transport: injectedTransport, botIdentity: injectedBotIdentity } = {}) {
@@ -147,7 +156,7 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
     },
     logEvent, logger,
   });
-  const expectedWebhook = { url: `${acc.wuzapi.baseUrl.includes('127.0.0.1') ? '' : ''}http://127.0.0.1:${acc.webhook.port}/hook/${acc.webhook?.pathToken || 'water'}`, events: undefined, baseUrlPrefix: 'http://127.0.0.1' };
+  const expectedWebhook = buildExpectedWebhook({ port: acc.webhook.port, pathToken: acc.webhook?.pathToken, advertiseHost: acc.webhook?.advertiseHost });
   const transportWatchdog = createTransportWatchdog({ transport, escalate: (sev, t) => escalator.escalate(sev, t), expectedWebhook, logEvent, logger, standby });
   if (standby) logger.log?.(`[water] STANDBY — connected + listening, NOT claiming the WuzAPI webhook (pre-flight)`);
 
@@ -310,19 +319,20 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
   async function start({ withTimers = true } = {}) {
     await learnIdentity();
     const pathToken = acc.webhook?.pathToken || 'water';
+    const bindHost = acc.webhook?.bindHost || '127.0.0.1';
     // HMAC posture (fail-loud): require a signed webhook UNLESS explicitly opted out with
-    // webhook.requireHmac:false (loopback-trust — the receiver binds 127.0.0.1 only). Never
-    // a silent skip: a missing key with requireHmac still on aborts the boot.
+    // webhook.requireHmac:false (trust the receiver's bind host + host firewall as the
+    // boundary). Never a silent skip: a missing key with requireHmac still on aborts the boot.
     const hmacKey = acc.wuzapi.hmacKey || '';
     const requireHmac = acc.webhook?.requireHmac !== false;
     if (requireHmac && !hmacKey) {
-      throw new Error('water: no wuzapi.hmacKey configured. Set the shared HMAC secret, or set webhook.requireHmac:false to trust the loopback bind (unsigned webhooks).');
+      throw new Error('water: no wuzapi.hmacKey configured. Set the shared HMAC secret, or set webhook.requireHmac:false to trust the bind host + firewall (unsigned webhooks).');
     }
     const skipHmac = !requireHmac && !hmacKey;
-    if (skipHmac) logger.warn?.('[water] HMAC DISABLED (webhook.requireHmac:false) — the webhook trusts the 127.0.0.1 bind only');
+    if (skipHmac) logger.warn?.(`[water] HMAC DISABLED (webhook.requireHmac:false) — unsigned webhooks trusted; the boundary is the ${bindHost} bind + host firewall`);
     heartbeat.start();
     receiver = createReceiver({
-      port: acc.webhook.port, pathToken, hmacKey, skipHmac,
+      port: acc.webhook.port, host: bindHost, pathToken, hmacKey, skipHmac,
       healthPayload: () => heartbeat.healthPayload(),
       emit: logEvent, logger,
       handlers: { onMessage, onConnectionEvent },
@@ -408,4 +418,4 @@ if (require.main === module) {
   main().catch((e) => { console.error('[water] fatal:', e.stack || e.message); process.exit(1); });
 }
 
-module.exports = { createDaemon, parseArgs };
+module.exports = { createDaemon, parseArgs, buildExpectedWebhook };

@@ -6,7 +6,7 @@ const os = require('node:os');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const { createDaemon } = require('../water');
+const { createDaemon, buildExpectedWebhook } = require('../water');
 const { openDb } = require('../lib/db');
 const { sign } = require('../lib/transport/hmac');
 
@@ -275,4 +275,24 @@ test('edit while a turn is in flight folds a correction into the live turn (no c
   assert.ok(injected && /order please umi/.test(injected.content), 'correction folded into the live turn');
   assert.equal(injected.source, 'edit-fold');
   await d.stop();
+});
+
+// Regression: the webhook URL water advertises to WuzAPI must honour webhook.advertiseHost.
+// The daemon ran inside a Docker-networked deployment where WuzAPI (in a container) posts to
+// water on the host; a hardcoded 127.0.0.1 advertised URL is the container's own loopback →
+// every delivery is "connection refused" and silently dropped. advertiseHost lets water
+// advertise the bridge-gateway address the container can actually reach.
+test('buildExpectedWebhook advertises webhook.advertiseHost (not a hardcoded 127.0.0.1)', () => {
+  // Default: loopback, unchanged behaviour for same-namespace deployments.
+  const def = buildExpectedWebhook({ port: 8090, pathToken: 'water' });
+  assert.equal(def.url, 'http://127.0.0.1:8090/hook/water');
+  assert.equal(def.baseUrlPrefix, 'http://127.0.0.1');
+
+  // Cross-namespace: the advertised URL + drift-detection prefix follow advertiseHost.
+  const gw = buildExpectedWebhook({ port: 8090, pathToken: 'water', advertiseHost: '172.21.0.1' });
+  assert.equal(gw.url, 'http://172.21.0.1:8090/hook/water');
+  assert.equal(gw.baseUrlPrefix, 'http://172.21.0.1');
+
+  // pathToken defaults to 'water'.
+  assert.equal(buildExpectedWebhook({ port: 9, advertiseHost: '10.0.0.5' }).url, 'http://10.0.0.5:9/hook/water');
 });

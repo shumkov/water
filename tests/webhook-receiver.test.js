@@ -40,6 +40,20 @@ before(async () => {
 });
 after(async () => { await recv.close(); });
 
+test('createReceiver binds the configured host (Docker-networked deployments need a non-loopback bind)', async () => {
+  // Default host is loopback; an explicit host must be honoured so WuzAPI in a container
+  // can reach water on the bridge. Bind 0.0.0.0 (a portable non-loopback address in CI).
+  const def = createReceiver({ port: 0, pathToken: TOKEN, hmacKey: KEY, handlers: {} });
+  const a1 = await def.listen();
+  assert.equal(a1.address, '127.0.0.1');
+  await def.close();
+
+  const wide = createReceiver({ port: 0, host: '0.0.0.0', pathToken: TOKEN, hmacKey: KEY, handlers: {} });
+  const a2 = await wide.listen();
+  assert.equal(a2.address, '0.0.0.0');
+  await wide.close();
+});
+
 test('healthz is unauthenticated and returns payload', async () => {
   const res = await fetch(base + '/healthz');
   assert.equal(res.status, 200);
