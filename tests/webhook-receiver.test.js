@@ -54,6 +54,16 @@ test('createReceiver binds the configured host (Docker-networked deployments nee
   await wide.close();
 });
 
+test('createReceiver.listen() rejects on a bind error (no uncaught crash)', async () => {
+  // Binding a taken port surfaces the same failure class as EADDRNOTAVAIL at boot; listen()
+  // must reject so the daemon exits non-zero and systemd retries, not throw an unhandled error.
+  const a = createReceiver({ port: 0, pathToken: TOKEN, hmacKey: KEY, handlers: {} });
+  const addr = await a.listen();
+  const b = createReceiver({ port: addr.port, host: '127.0.0.1', pathToken: TOKEN, hmacKey: KEY, handlers: {} });
+  await assert.rejects(() => b.listen(), /EADDRINUSE/);
+  await a.close();
+});
+
 test('healthz is unauthenticated and returns payload', async () => {
   const res = await fetch(base + '/healthz');
   assert.equal(res.status, 200);
