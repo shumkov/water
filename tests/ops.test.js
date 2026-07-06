@@ -41,6 +41,19 @@ test('escalation-failed is logged loudly when the IPC path is down', async () =>
   assert.ok(events.includes('escalation-failed'));
 });
 
+test('no ipcBot configured → escalation is a no-op (no IPC attempt, no escalation-failed noise)', async () => {
+  // Netdata is the single alert surface; with no ipcBot, escalate must NOT hit the IPC (which
+  // would fail to /tmp/polygram-undefined.sock and inflate healthz.escalated). It just records
+  // an escalation-skipped event and returns false.
+  const events = [];
+  let tellCalls = 0;
+  const e = createEscalator({ ipcBot: undefined, chatId: '1', tellFn: async () => { tellCalls++; }, logEvent: (k) => events.push(k), logger: { error() {} } });
+  assert.equal(await e.escalate('CRITICAL', 'x'), false);
+  assert.equal(tellCalls, 0, 'no ipcBot → the IPC send must not be attempted');
+  assert.ok(events.includes('escalation-skipped'));
+  assert.ok(!events.includes('escalation-failed'), 'no failed-event noise when disabled');
+});
+
 // --- SLA watchdog ---
 function seedStuck(d, { ageMs, human = false }) {
   const now = Date.now();
