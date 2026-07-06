@@ -126,3 +126,33 @@ test('transport watchdog in STANDBY does not claim the webhook', async () => {
   await wd2.poll();
   assert.equal(setCalls2, 1, 'non-standby claims the empty webhook');
 });
+
+test('transport watchdog self-heals an advertiseHost change (same path, new host) — not foreign', async () => {
+  const { createTransportWatchdog } = require('../lib/ops/transport-watchdog');
+  // WuzAPI holds water's OWN prior webhook at the loopback host; water now advertises the
+  // docker-bridge gateway. Same /hook/water path → recognise as ours → repair to the new URL,
+  // instead of mistaking it for a foreign consumer and dead-locking (the production trap).
+  let setUrl = null;
+  const transport = {
+    async sessionStatus() { return { connected: true, webhook: 'http://127.0.0.1:8090/hook/water' }; },
+    async setWebhook({ url }) { setUrl = url; },
+  };
+  const expectedWebhook = { url: 'http://172.21.0.1:8090/hook/water', path: '/hook/water', baseUrlPrefix: 'http://172.21.0.1' };
+  const wd = createTransportWatchdog({ transport, escalate: async () => {}, expectedWebhook });
+  await wd.poll();
+  assert.equal(setUrl, 'http://172.21.0.1:8090/hook/water', 'a host-only change must self-heal to the new advertiseHost URL');
+});
+
+test('transport watchdog leaves a genuinely foreign endpoint (different path) alone + escalates', async () => {
+  const { createTransportWatchdog } = require('../lib/ops/transport-watchdog');
+  let setCalls = 0; let escalated = null;
+  const transport = {
+    async sessionStatus() { return { connected: true, webhook: 'http://10.0.0.9:8090/hook/other' }; },
+    async setWebhook() { setCalls++; },
+  };
+  const expectedWebhook = { url: 'http://172.21.0.1:8090/hook/water', path: '/hook/water', baseUrlPrefix: 'http://172.21.0.1' };
+  const wd = createTransportWatchdog({ transport, escalate: async (sev, t) => { escalated = { sev, t }; }, expectedWebhook });
+  await wd.poll();
+  assert.equal(setCalls, 0, 'a different /hook path is a foreign consumer → do not clobber');
+  assert.equal(escalated?.sev, 'INFO');
+});

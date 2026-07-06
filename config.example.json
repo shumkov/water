@@ -6,7 +6,7 @@
         "userToken": "<wuzapi-user-token>",
         "hmacKey": "<shared-webhook-hmac-secret>"
       },
-      "webhook": { "port": 8090, "pathToken": "water" },
+      "webhook": { "port": 8090, "pathToken": "water", "bindHost": "127.0.0.1", "advertiseHost": "127.0.0.1" },
       "dmPolicy": "allowlist",
       "groupPolicy": "allowlist",
       "adminJids": ["<ivan-pn>@s.whatsapp.net", "<ivan-lid>@lid"],
