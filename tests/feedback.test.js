@@ -217,6 +217,23 @@ test('typing: announces `available` user-presence at begin + each refresh (Whats
   } finally { mock.timers.reset(); }
 });
 
+test('typing: a delivered reply stops the loop immediately — no "typing…" re-appears after the message lands', () => {
+  mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  try {
+    const t = mkTransport();
+    const fb = createFeedback({ transport: t, logger: SILENT, settings: { typing: { enabled: true }, ackReaction: { group: 'never' } } });
+    const h = fb.begin(msg());
+    mock.timers.tick(REFRESH_MS);                                   // typing running
+    const composingBefore = t._presence.filter((p) => p.state === 'composing').length;
+    fb.onReplyDelivered('G@g.us');                                  // reply lands MID-turn
+    assert.equal(t._presence.at(-1).state, 'paused', 'a delivered reply pauses typing at once');
+    mock.timers.tick(REFRESH_MS * 3);                              // turn still running (quiet window / post-reply work)
+    const composingAfter = t._presence.filter((p) => p.state === 'composing').length;
+    assert.equal(composingAfter, composingBefore, 'no composing after the reply — the indicator must not re-appear once the message is sent');
+    h.end({ ok: true, delivered: true });
+  } finally { mock.timers.reset(); }
+});
+
 test('typing: NEVER sends `unavailable` — user presence is global; an ending/capped turn must not knock a concurrent chat offline', () => {
   mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
   try {
