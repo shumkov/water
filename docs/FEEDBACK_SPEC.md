@@ -107,10 +107,14 @@ fired against the turn's `sourceMsgId`; `fb.end` reads that and **does not clear
 ### 4.4 Typing — Phase B (G1)
 - `begin`: fire `setPresence(msg.chatJid, 'composing')` once, then every `REFRESH_MS` (a hardcoded
   constant ≈ the WuzAPI ~5s expiry per `docs/wuzapi-contract.md` — NOT config; scope-F2).
-- **Cap the loop** at `MAX_TYPING_MS` (≈ 2–3 min, « the 90-min `maxTurnHard`) AND stop it when the
-  SLA **holding reply** fires — a "typing…" that persists for 90 min reads as *wedged*, and it
-  contradicts the "a human will follow up" holding message. Coordinating requires the feedback
-  controller and the SLA watchdog to share turn identity (sessionKey + turn start). (adversarial-F2)
+- **Cap the loop** at `MAX_TYPING_MS` (= 180_000 ms / 3 min, « the 90-min `maxTurnHard`): a
+  "typing…" that persists for tens of minutes reads as *wedged*. **Implementation note:** the
+  original concern here — coordinating the cap with the SLA **holding reply** so typing stops
+  before the "a human will follow up" message — turned out **moot by construction**. The holding
+  reply fires at ~92 min (well past `maxTurnHard`), while typing is hard-capped at 3 min, so the
+  loop is always long dead before any holding message could contradict it. No shared turn identity
+  between the feedback controller and the SLA watchdog is needed; the cap alone suffices.
+  (adversarial-F2 — resolved: coordination unnecessary.)
 - `end`: clear the interval + one `setPresence(msg.chatJid, 'paused')`.
 - Typing may also fire on replay (the turn genuinely runs now) — but NOT on injected/synthetic
   turns (no human waiting). Sub-5s turns flicker briefly; acceptable (adversarial-F10).
@@ -163,6 +167,7 @@ controller drives it (no SDK `context.reactor` dual-path). Not started until Pha
   error→🤯; ok-no-reply→✅; ok-with-reply→clear; agent-reacted→no-clear. `never`→no react.
   `mentions` honors the threaded `addressed` bit. `isReplay`/`inj-`→no ack.
 - **Typing:** composing at begin (immediately), paused at end, interval cleared; capped at
-  MAX_TYPING_MS; stopped on SLA holding reply; skipped for injected turns.
+  MAX_TYPING_MS (SLA-holding coordination is moot by construction — see §4.4); skipped for
+  injected turns.
 - **Best-effort:** transport throwing on presence/react leaves the turn result unchanged.
 - **Config:** invalid `feedback.*` fails validation (account + chat level).

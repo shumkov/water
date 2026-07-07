@@ -1,8 +1,8 @@
 'use strict';
 
-const { test } = require('node:test');
+const { test, mock } = require('node:test');
 const assert = require('node:assert/strict');
-const { createFeedback } = require('../lib/feedback/feedback');
+const { createFeedback, REFRESH_MS, MAX_TYPING_MS } = require('../lib/feedback/feedback');
 
 // The reactor applies emoji through a serialized promise chain (applyChain), so
 // react/setPresence land asynchronously — flush the queue before asserting.
@@ -35,7 +35,7 @@ test('begin fires the 👀 ack (with participantJid) + composing presence; end �
 
 test('progress cascade: thinking → tool(web) → subagent map to 🤔 / ⚡ / 👾', async () => {
   const t = mkTransport();
-  const fb = createFeedback({ transport: t, logger: SILENT, settings: { ackReaction: { group: 'never' } } });
+  const fb = createFeedback({ transport: t, logger: SILENT, settings: { ackReaction: { group: 'always' } } });
   const h = fb.begin(msg());
   fb.onEvent('G@g.us', 'thinking'); await tick();
   fb.onEvent('G@g.us', 'tool-use', 'WebFetch'); await tick();   // tool-use payload is the toolName STRING
@@ -104,12 +104,35 @@ test('best-effort: a throwing transport never throws out of begin/onEvent/end', 
   await tick();
 });
 
-test('ackReaction:never → no ack reaction, but cascade + typing still work', async () => {
+test('ackReaction:never → NO reactions at all (no ack, no cascade, no terminal), typing still works', async () => {
   const t = mkTransport();
   const fb = createFeedback({ transport: t, logger: SILENT, settings: { typing: { enabled: true }, ackReaction: { group: 'never' } } });
+  const h = fb.begin(msg());
+  fb.onEvent('G@g.us', 'thinking');
+  fb.onEvent('G@g.us', 'tool-use', 'Bash');
+  await tick();
+  assert.equal(t._reacts.length, 0, 'never → the cascade must not fire either');
+  assert.equal(t._presence[0].state, 'composing', 'typing still runs');
+  h.end({ ok: true, delivered: false }); await tick();
+  assert.equal(t._reacts.length, 0, 'never → no terminal ✅ either');
+  assert.equal(t._presence.at(-1).state, 'paused');
+});
+
+test('parallel subagents: the 👾 work-hold survives until the LAST subagent-done', async () => {
+  const t = mkTransport();
+  const fb = createFeedback({ transport: t, logger: SILENT, settings: { ackReaction: { group: 'always' } } });
   const h = fb.begin(msg()); await tick();
-  assert.ok(!t._reacts.some((r) => r.emoji === '👀'), 'never → no 👀');
-  assert.equal(t._presence[0].state, 'composing');
+  // Two concurrent subagents; the first finishing must NOT release the hold.
+  fb.onEvent('G@g.us', 'subagent-start', {});
+  fb.onEvent('G@g.us', 'subagent-start', {});
+  await tick();
+  assert.equal(t._reacts.at(-1).emoji, '👾');
+  fb.onEvent('G@g.us', 'subagent-done', {});   // first done — second still running
+  await tick();
+  assert.equal(t._reacts.at(-1).emoji, '👾', 'hold survives while a second subagent runs');
+  fb.onEvent('G@g.us', 'subagent-done', {});   // last done → back to 🤔
+  await tick();
+  assert.equal(t._reacts.at(-1).emoji, '🤔', 'last subagent-done releases → THINKING');
   h.end({ ok: true, delivered: true }); await tick();
 });
 
@@ -118,4 +141,51 @@ test('end is idempotent + a no-op for an unknown session', () => {
   const fb = createFeedback({ transport: t, logger: SILENT, settings: { ackReaction: { group: 'always' } } });
   const h = fb.begin(msg());
   assert.doesNotThrow(() => { h.end({ ok: true }); h.end({ ok: true }); }); // double end
+});
+
+// ── Typing loop (fake timers) ───────────────────────────────────────────────────
+// Only the typing timers are exercised here (ackReaction:'never' ⇒ no reactor ⇒ no
+// reactor timers to interfere), so the mock clock drives just the composing loop.
+
+test('typing: the REFRESH_MS interval re-fires setPresence(composing)', () => {
+  mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  try {
+    const t = mkTransport();
+    const fb = createFeedback({ transport: t, logger: SILENT, settings: { typing: { enabled: true }, ackReaction: { group: 'never' } } });
+    fb.begin(msg());
+    const composing = () => t._presence.filter((p) => p.state === 'composing').length;
+    assert.equal(composing(), 1, 'fires once immediately');
+    mock.timers.tick(REFRESH_MS);
+    assert.equal(composing(), 2, 'refreshed on the interval');
+    mock.timers.tick(REFRESH_MS);
+    assert.equal(composing(), 3);
+  } finally { mock.timers.reset(); }
+});
+
+test('typing: the MAX_TYPING_MS cap stops the loop + sends paused', () => {
+  mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  try {
+    const t = mkTransport();
+    const fb = createFeedback({ transport: t, logger: SILENT, settings: { typing: { enabled: true }, ackReaction: { group: 'never' } } });
+    fb.begin(msg());
+    mock.timers.tick(MAX_TYPING_MS);
+    assert.equal(t._presence.at(-1).state, 'paused', 'cap → paused');
+    const n = t._presence.length;
+    mock.timers.tick(REFRESH_MS * 5);
+    assert.equal(t._presence.length, n, 'no further composing after the cap');
+  } finally { mock.timers.reset(); }
+});
+
+test('typing: end() clears the interval — no composing fires afterward', () => {
+  mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  try {
+    const t = mkTransport();
+    const fb = createFeedback({ transport: t, logger: SILENT, settings: { typing: { enabled: true }, ackReaction: { group: 'never' } } });
+    const h = fb.begin(msg());
+    h.end({ ok: true, delivered: true });
+    assert.equal(t._presence.at(-1).state, 'paused');
+    const n = t._presence.length;
+    mock.timers.tick(REFRESH_MS * 5);
+    assert.equal(t._presence.length, n, 'interval cleared by end()');
+  } finally { mock.timers.reset(); }
 });

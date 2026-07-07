@@ -105,6 +105,15 @@ describe('createReactionManager — state transitions', () => {
     await new Promise(r => setTimeout(r, 20));
     assert.ok(applied.includes('👍'));
   });
+
+  test('COMPLETE (water-added) is terminal → ✅ flushes past throttle', async () => {
+    const { m, applied } = makeHarness({ throttleMs: 500 });
+    m.setState('THINKING');
+    await new Promise(r => setTimeout(r, 5));
+    m.setState('COMPLETE'); // handled-no-reply outcome — must flush immediately
+    await new Promise(r => setTimeout(r, 20));
+    assert.ok(applied.includes('✅'), 'COMPLETE flushes its ✅ without waiting on the throttle');
+  });
 });
 
 describe('createReactionManager — clear + stop', () => {
