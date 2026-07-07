@@ -65,21 +65,25 @@ test('end resolution: completed with NO reply → durable ✅ (not cleared)', as
   assert.ok(!t._reacts.some((r) => r.emoji === null), 'no-reply must NOT clear the ack');
 });
 
-test('end resolution: completed WITH reply → clears the ack (react null)', async () => {
+test('end resolution: completed WITH reply → durable ✅ (a vanishing ack reads as "never rendered")', async () => {
   const t = mkTransport();
   const fb = createFeedback({ transport: t, logger: SILENT, settings: { ackReaction: { group: 'always' } } });
   const h = fb.begin(msg()); await tick();
   h.end({ ok: true, delivered: true }); await tick();
-  assert.equal(t._reacts.at(-1).emoji, null, 'delivered → clear');
+  // A successful turn leaves a persistent ✅ on the user's message — the signal partners
+  // actually see. Clearing it the instant the reply landed is why reactions looked absent.
+  assert.equal(t._reacts.at(-1).emoji, '✅', 'delivered → durable ✅, not cleared');
+  assert.ok(!t._reacts.some((r) => r.emoji === null), 'success must NOT clear the ack');
 });
 
-test('no-clobber: when the agent set its own reaction, end does NOT clear', async () => {
+test('no-clobber: when the agent set its own reaction, end leaves it untouched (no ✅/clear)', async () => {
   const t = mkTransport();
   const fb = createFeedback({ transport: t, logger: SILENT, settings: { ackReaction: { group: 'always' } } });
   const h = fb.begin(msg()); await tick();
   fb.markAgentReacted('G@g.us');
   h.end({ ok: true, delivered: true }); await tick();
-  assert.ok(!t._reacts.some((r) => r.emoji === null), 'agent reaction must be left untouched');
+  assert.ok(!t._reacts.some((r) => r.emoji === null), 'agent reaction must not be cleared');
+  assert.ok(!t._reacts.some((r) => r.emoji === '✅'), 'agent reaction must not be stomped by ✅');
 });
 
 test('replay + synthetic(inj-/water:inject) turns get NO feedback', async () => {
@@ -134,6 +138,41 @@ test('parallel subagents: the 👾 work-hold survives until the LAST subagent-do
   await tick();
   assert.equal(t._reacts.at(-1).emoji, '🤔', 'last subagent-done releases → THINKING');
   h.end({ ok: true, delivered: true }); await tick();
+});
+
+test('instrumentation: begin/reaction-transition/react-sent/presence/end are emitted to logEvent', async () => {
+  const t = mkTransport();
+  const events = [];
+  const fb = createFeedback({
+    transport: t, logger: SILENT, logEvent: (kind, detail) => events.push({ kind, detail }),
+    settings: { typing: { enabled: true }, ackReaction: { group: 'always' } },
+  });
+  const h = fb.begin(msg()); await tick();
+  h.end({ ok: true, delivered: true }); await tick();
+  const kinds = new Set(events.map((e) => e.kind));
+  for (const k of ['feedback-begin', 'feedback-reaction', 'feedback-react-sent', 'feedback-presence', 'feedback-end']) {
+    assert.ok(kinds.has(k), `missing instrumentation event: ${k}`);
+  }
+  // The network-outcome event carries the exact participant + msgId sent to WuzAPI, so a
+  // group reaction that returns 200 but never renders is diagnosable from the DB alone.
+  const sent = events.find((e) => e.kind === 'feedback-react-sent');
+  assert.equal(sent.detail.participant, '55@lid');
+  assert.equal(sent.detail.msgId, 'M1');
+  assert.equal(events.find((e) => e.kind === 'feedback-end').detail.resolution, 'complete');
+});
+
+test('instrumentation: a failed react emits feedback-react-failed with the error', async () => {
+  const t = { react: async () => { throw new Error('nope'); }, setPresence: async () => {} };
+  const events = [];
+  const fb = createFeedback({
+    transport: t, logger: SILENT, logEvent: (kind, detail) => events.push({ kind, detail }),
+    settings: { ackReaction: { group: 'always' } },
+  });
+  fb.begin(msg()); await tick();
+  const failed = events.find((e) => e.kind === 'feedback-react-failed');
+  assert.ok(failed, 'a rejecting transport.react must surface a feedback-react-failed event');
+  assert.equal(failed.detail.error, 'nope');
+  assert.equal(failed.detail.participant, '55@lid');
 });
 
 test('end is idempotent + a no-op for an unknown session', () => {
