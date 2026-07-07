@@ -9,11 +9,12 @@ const { createFeedback, REFRESH_MS, MAX_TYPING_MS } = require('../lib/feedback/f
 const tick = async () => { for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r)); };
 
 function mkTransport(over = {}) {
-  const reacts = []; const presence = [];
+  const reacts = []; const presence = []; const userPresence = [];
   return {
     react: async (a) => { reacts.push(a); },
     setPresence: async (chatJid, state) => { presence.push({ chatJid, state }); },
-    _reacts: reacts, _presence: presence, ...over,
+    setUserPresence: async (state) => { userPresence.push(state); },
+    _reacts: reacts, _presence: presence, _userPresence: userPresence, ...over,
   };
 }
 const msg = (over = {}) => ({ chatJid: 'G@g.us', chatType: 'group', msgId: 'M1', sender: { jid: '55@lid' }, ...over });
@@ -198,6 +199,36 @@ test('typing: the REFRESH_MS interval re-fires setPresence(composing)', () => {
     assert.equal(composing(), 2, 'refreshed on the interval');
     mock.timers.tick(REFRESH_MS);
     assert.equal(composing(), 3);
+  } finally { mock.timers.reset(); }
+});
+
+test('typing: announces `available` user-presence at begin + each refresh (WhatsApp drops "typing…" when the account is not online)', () => {
+  mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  try {
+    const t = mkTransport();
+    const fb = createFeedback({ transport: t, logger: SILENT, settings: { typing: { enabled: true }, ackReaction: { group: 'never' } } });
+    fb.begin(msg());
+    const available = () => t._userPresence.filter((s) => s === 'available').length;
+    assert.equal(available(), 1, 'announces available immediately — else typing lapses and flickers');
+    mock.timers.tick(REFRESH_MS);
+    assert.equal(available(), 2, 're-announced on each refresh so online never lapses mid-turn');
+    mock.timers.tick(REFRESH_MS);
+    assert.equal(available(), 3);
+  } finally { mock.timers.reset(); }
+});
+
+test('typing: NEVER sends `unavailable` — user presence is global; an ending/capped turn must not knock a concurrent chat offline', () => {
+  mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  try {
+    const t = mkTransport();
+    const fb = createFeedback({ transport: t, logger: SILENT, settings: { typing: { enabled: true }, ackReaction: { group: 'never' } } });
+    const h = fb.begin(msg());
+    mock.timers.tick(REFRESH_MS * 2);
+    h.end({ ok: true, delivered: true });
+    mock.timers.tick(MAX_TYPING_MS);          // exercise the post-end / cap path too
+    assert.ok(t._userPresence.length > 0, 'sanity: available was announced');
+    assert.ok(!t._userPresence.includes('unavailable'), 'must NEVER send unavailable (would offline a concurrent turn)');
+    assert.ok(t._userPresence.every((s) => s === 'available'), 'the only global-presence state ever sent is available');
   } finally { mock.timers.reset(); }
 });
 
