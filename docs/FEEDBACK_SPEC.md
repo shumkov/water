@@ -80,13 +80,25 @@ them. Safe — the message is already gated to dispatch.
   (it's the message author's key) — bind it explicitly. (feasibility-F2 / adversarial-F3)
 - **end (resolution)** — driven by `{ ok, delivered }`:
   - error (`!ok`) → **🤯**.
-  - completed but **no reply delivered** (`ok && !delivered` — NO_REPLY / tool-only / silence) →
-    leave **✅** (do NOT clear; clearing makes the partner see "bot noticed then dismissed me").
-    (adversarial-F8)
-  - completed **and** a reply was delivered → **clear** the 👀 (polygram-style: success = a clean
-    text answer), UNLESS the agent's `react` tool already set a reaction on this `sourceMsgId`
-    (see §4.3) — then leave it.
+  - completed (`ok`, with or without a reply) → leave a durable **✅**, UNLESS the agent's
+    `react` tool already set a reaction on this `sourceMsgId` (see §4.3) — then leave that.
+  - **Revised from v2's "clear on delivered".** On WhatsApp the whole cascade cleared the
+    instant the text reply landed, so partners reported seeing *no reactions at all* — the
+    👀→🤔→🔥 flashed and vanished sub-second. A persistent ✅ is the durable signal partners
+    actually see (matching the no-reply case), and it doubles as the render probe: if a ✅
+    stays on the message, WhatsApp renders water's reactions; if not, the participant/key is
+    wrong. Reverting to clear-on-success is a one-branch change once rendering is confirmed.
 - Hardcoded emojis (👀/✅/🤯) — not config (scope-F3).
+
+### 4.5 Instrumentation (added — the path was silent)
+Every feedback action mirrors into the DB `events` table (via water's `logEvent`) + a debug
+log, so a reaction WuzAPI accepts (HTTP 200) but WhatsApp never renders is diagnosable
+post-hoc. Event kinds: `feedback-begin` (chatType, participant, wantReactions/wantTyping),
+`feedback-reaction` (reactor transition: fromState→toState, emoji, source), `feedback-react-sent`
+/ `feedback-react-failed` (network outcome + the exact **participant** + msgId sent to WuzAPI),
+`feedback-presence` / `feedback-presence-failed` (composing/paused), `feedback-end` (ok,
+delivered, resolution). `logEvent` is optional (defaults to no-op) and wrapped so it never
+throws into the best-effort path.
 
 ### 4.2 The `addressed` bit (must-fix — `mentions` is otherwise unimplementable)
 The gate computes `isMentioned` and **throws it away** (`gate.decide` returns only `{action,
@@ -106,7 +118,9 @@ fired against the turn's `sourceMsgId`; `fb.end` reads that and **does not clear
 
 ### 4.4 Typing — Phase B (G1)
 - `begin`: fire `setPresence(msg.chatJid, 'composing')` once, then every `REFRESH_MS` (a hardcoded
-  constant ≈ the WuzAPI ~5s expiry per `docs/wuzapi-contract.md` — NOT config; scope-F2).
+  constant — NOT config; scope-F2). Set to **4000 ms, comfortably UNDER** the WuzAPI ~5s expiry
+  (`docs/wuzapi-contract.md`). Refreshing at exactly 5s let the indicator lapse at each boundary
+  before the next composing landed → a visible typing flicker (start/stop/start) partners saw.
 - **Cap the loop** at `MAX_TYPING_MS` (= 180_000 ms / 3 min, « the 90-min `maxTurnHard`): a
   "typing…" that persists for tens of minutes reads as *wedged*. **Implementation note:** the
   original concern here — coordinating the cap with the SLA **holding reply** so typing stops
@@ -153,8 +167,10 @@ controller drives it (no SDK `context.reactor` dual-path). Not started until Pha
 ## 8. Decisions for the sync
 1. **Phased rollout** — Phase A (ack) first, Phase B (typing) after a live presence probe,
    Phase C later? *(recommended — de-risks the weak/unvalidated half)*
-2. **Ack resolution** confirmed: 🤯 on error / ✅ on completed-no-reply / clear on
-   completed-with-reply (unless the agent reacted). OK?
+2. **Ack resolution** (revised, see §4.1): 🤯 on error / durable **✅ on any success**
+   (unless the agent reacted). The v2 "clear on completed-with-reply" is dropped — clearing
+   made partners see no reactions at all. Revert to clear-on-success once WhatsApp rendering
+   is confirmed via the persistent ✅.
 3. **`addressed` threading** through the gate *(recommended)* vs. scoping `mentions` to
    `requireMention:true` only for v1.
 4. **Live probes** before Phase B: does group **typing** actually render, and are 👀/✅/🤯

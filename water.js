@@ -72,7 +72,7 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
   // Per-turn responsiveness feedback (typing + reaction cascade). Created before the
   // tool-dispatcher (an agent `react` flags markAgentReacted) and the PM (whose callbacks
   // drive the cascade). See docs/FEEDBACK_SPEC.md.
-  const feedback = createFeedback({ transport, settings: acc.feedback || {}, logger });
+  const feedback = createFeedback({ transport, settings: acc.feedback || {}, logger, logEvent });
 
   // Delivery: the tool-dispatcher claude calls mid-turn (reply/edit/react).
   const toolDispatcher = createChannelsToolDispatcher({
