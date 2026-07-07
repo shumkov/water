@@ -9,11 +9,12 @@ const { createFeedback, REFRESH_MS, MAX_TYPING_MS } = require('../lib/feedback/f
 const tick = async () => { for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r)); };
 
 function mkTransport(over = {}) {
-  const reacts = []; const presence = [];
+  const reacts = []; const presence = []; const userPresence = [];
   return {
     react: async (a) => { reacts.push(a); },
     setPresence: async (chatJid, state) => { presence.push({ chatJid, state }); },
-    _reacts: reacts, _presence: presence, ...over,
+    setUserPresence: async (state) => { userPresence.push(state); },
+    _reacts: reacts, _presence: presence, _userPresence: userPresence, ...over,
   };
 }
 const msg = (over = {}) => ({ chatJid: 'G@g.us', chatType: 'group', msgId: 'M1', sender: { jid: '55@lid' }, ...over });
@@ -198,6 +199,21 @@ test('typing: the REFRESH_MS interval re-fires setPresence(composing)', () => {
     assert.equal(composing(), 2, 'refreshed on the interval');
     mock.timers.tick(REFRESH_MS);
     assert.equal(composing(), 3);
+  } finally { mock.timers.reset(); }
+});
+
+test('typing: announces `available` user-presence at begin + each refresh (WhatsApp drops "typing…" when the account is not online)', () => {
+  mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  try {
+    const t = mkTransport();
+    const fb = createFeedback({ transport: t, logger: SILENT, settings: { typing: { enabled: true }, ackReaction: { group: 'never' } } });
+    fb.begin(msg());
+    const available = () => t._userPresence.filter((s) => s === 'available').length;
+    assert.equal(available(), 1, 'announces available immediately — else typing lapses and flickers');
+    mock.timers.tick(REFRESH_MS);
+    assert.equal(available(), 2, 're-announced on each refresh so online never lapses mid-turn');
+    mock.timers.tick(REFRESH_MS);
+    assert.equal(available(), 3);
   } finally { mock.timers.reset(); }
 });
 
