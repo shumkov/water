@@ -20,6 +20,7 @@ const { createRecordInbound } = require('./lib/handlers/record-inbound');
 const { createGate } = require('./lib/handlers/gate');
 const { createDispatcher } = require('./lib/handlers/dispatcher');
 const { createChannelsToolDispatcher } = require('./lib/process/channels-tool-dispatcher');
+const { createFeedback } = require('./lib/feedback/feedback');
 const { chunkMarkdownText } = require('./lib/delivery/chunk');
 const { toWhatsApp } = require('./lib/delivery/format');
 const { WATER_DISPLAY_HINT } = require('./lib/delivery/display-hint');
@@ -68,9 +69,14 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
   outbound.sweepCrashed();
   // Mark still-in-flight rows replay-pending happens at shutdown; boot replay runs in start().
 
+  // Per-turn responsiveness feedback (typing + reaction cascade). Created before the
+  // tool-dispatcher (an agent `react` flags markAgentReacted) and the PM (whose callbacks
+  // drive the cascade). See docs/FEEDBACK_SPEC.md.
+  const feedback = createFeedback({ transport, settings: acc.feedback || {}, logger });
+
   // Delivery: the tool-dispatcher claude calls mid-turn (reply/edit/react).
   const toolDispatcher = createChannelsToolDispatcher({
-    transport, outbound, account,
+    transport, outbound, account, feedback,
     chunkText: chunkMarkdownText, formatText: toWhatsApp,
     logEvent: (kind, detail) => logEvent(kind, detail), logger,
   });
@@ -93,7 +99,19 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
     surfaceName: 'WhatsApp',
     pmDefault: 'cli',
   });
-  const pm = new ProcessManager({ processFactory: factory, budget: acc.processBudget || 9, logger });
+  // orchestra ProcessManager callbacks drive the reaction cascade: turn-start/thinking →
+  // 🤔, tool-use → tool face, subagent → 👾. Re-wired on every spawn (respawn-safe). The
+  // callback signature is (sessionKey, ...payload, proc); tool-use's payload is the toolName.
+  const pm = new ProcessManager({
+    processFactory: factory, budget: acc.processBudget || 9, logger,
+    callbacks: {
+      onTurnStart:     (sk, p) => feedback.onEvent(sk, 'turn-start', p),
+      onThinking:      (sk) => feedback.onEvent(sk, 'thinking'),
+      onToolUse:       (sk, toolName) => feedback.onEvent(sk, 'tool-use', toolName),
+      onSubagentStart: (sk, p) => feedback.onEvent(sk, 'subagent-start', p),
+      onSubagentDone:  (sk, p) => feedback.onEvent(sk, 'subagent-done', p),
+    },
+  });
 
   function logEvent(kind, detail) {
     try { db.prepare('INSERT INTO events (ts, chat_jid, kind, detail_json) VALUES (?,?,?,?)').run(Date.now(), detail?.chatJid || detail?.chat_jid || null, kind, JSON.stringify(detail || {})); } catch { /* best effort */ }
@@ -140,7 +158,7 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
 
   const dispatcher = createDispatcher({
     pm, sessions, status, resolveChat: resolve, defaults: scoped.defaults,
-    deliverFallback, errorReply, classify, attachmentsFor, fetchMedia,
+    deliverFallback, errorReply, classify, attachmentsFor, fetchMedia, feedback,
     mediaMaxBytes: (acc.mediaMaxMb || 32) * 1024 * 1024, logEvent, logger,
   });
 

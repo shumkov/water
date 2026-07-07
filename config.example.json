@@ -24,7 +24,10 @@
         "th": "สวัสดีค่ะ ทีมงานกำลังดำเนินการ เดี๋ยวมีเจ้าหน้าที่ติดต่อกลับนะคะ – UMI"
       },
       "voice": { "enabled": true, "provider": "openai" },
-      "ackReaction": { "dm": "always", "group": "mentions" },
+      "feedback": {
+        "typing": { "enabled": false },
+        "ackReaction": { "dm": "always", "group": "mentions" }
+      },
       "processBudget": 9
     }
   },

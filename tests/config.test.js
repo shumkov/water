@@ -19,7 +19,7 @@ function base() {
         groupPolicy: 'allowlist',
         adminJids: ['1@s.whatsapp.net'],
         escalation: { ipcBot: 'shumabit', chatId: '68861949' },
-        ackReaction: { dm: 'always', group: 'mentions' },
+        feedback: { typing: { enabled: false }, ackReaction: { dm: 'always', group: 'mentions' } },
         processBudget: 9,
       },
     },
@@ -78,10 +78,22 @@ test('rejects maxTurnHard < maxTurn', () => {
   assert.throws(() => validateConfig(c), /maxTurnHard must be >= maxTurn/);
 });
 
-test('rejects a bad ackReaction mode', () => {
+test('rejects a bad feedback.ackReaction mode', () => {
   const c = base();
-  c.accounts.umi.ackReaction.group = 'sometimes';
+  c.accounts.umi.feedback.ackReaction.group = 'sometimes';
   assert.throws(() => validateConfig(c), /ackReaction/);
+});
+
+test('rejects a non-boolean feedback.typing.enabled', () => {
+  const c = base();
+  c.accounts.umi.feedback.typing.enabled = 'yes';
+  assert.throws(() => validateConfig(c), /feedback\.typing\.enabled/);
+});
+
+test('rejects an unknown feedback.ackReaction key (typo)', () => {
+  const c = base();
+  c.accounts.umi.feedback.ackReaction.grup = 'always';
+  assert.throws(() => validateConfig(c), /only dm\/group/);
 });
 
 test('scopeToAccount narrows chats to the account', () => {
