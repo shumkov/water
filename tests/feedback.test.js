@@ -217,6 +217,21 @@ test('typing: announces `available` user-presence at begin + each refresh (Whats
   } finally { mock.timers.reset(); }
 });
 
+test('typing: NEVER sends `unavailable` — user presence is global; an ending/capped turn must not knock a concurrent chat offline', () => {
+  mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  try {
+    const t = mkTransport();
+    const fb = createFeedback({ transport: t, logger: SILENT, settings: { typing: { enabled: true }, ackReaction: { group: 'never' } } });
+    const h = fb.begin(msg());
+    mock.timers.tick(REFRESH_MS * 2);
+    h.end({ ok: true, delivered: true });
+    mock.timers.tick(MAX_TYPING_MS);          // exercise the post-end / cap path too
+    assert.ok(t._userPresence.length > 0, 'sanity: available was announced');
+    assert.ok(!t._userPresence.includes('unavailable'), 'must NEVER send unavailable (would offline a concurrent turn)');
+    assert.ok(t._userPresence.every((s) => s === 'available'), 'the only global-presence state ever sent is available');
+  } finally { mock.timers.reset(); }
+});
+
 test('typing: the MAX_TYPING_MS cap stops the loop + sends paused', () => {
   mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
   try {
