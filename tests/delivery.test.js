@@ -53,6 +53,34 @@ test('reply: sends chunks, quote only on the first, returns first msgId, write-b
   assert.ok(rows.every((x) => x.status === 'sent'));
 });
 
+test('reply(files): an image is sent with its real MIME (not octet-stream) so WuzAPI /chat/send/image accepts it', async () => {
+  const { td, calls } = harness();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-media-'));
+  const pngPath = path.join(dir, 'qr.png');
+  // a real (tiny) 1x1 PNG
+  fs.writeFileSync(pngPath, Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c6360000000020001e221bc330000000049454e44ae426082', 'hex'));
+  const r = await td({ sessionKey: 'g@g.us', chatId: 'g@g.us', toolName: 'reply', text: 'here', files: [pngPath], sessionCwd: dir });
+  assert.equal(r.ok, true);
+  assert.equal(calls.sendMedia.length, 1, 'one media send');
+  const m = calls.sendMedia[0];
+  assert.equal(m.kind, 'image');
+  assert.equal(m.mimeType, 'image/png', 'must carry the real image MIME — octet-stream makes WuzAPI reject the image with HTTP 400');
+  assert.ok(m.data.startsWith('data:image/png;base64,'), `data URL must carry the image MIME, got: ${m.data.slice(0, 40)}`);
+});
+
+test('reply(files): a document keeps document kind + a real MIME', async () => {
+  const { td, calls } = harness();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-doc-'));
+  const txtPath = path.join(dir, 'note.txt');
+  fs.writeFileSync(txtPath, 'hello');
+  const r = await td({ sessionKey: 'g@g.us', chatId: 'g@g.us', toolName: 'reply', text: 'file', files: [txtPath], sessionCwd: dir });
+  assert.equal(r.ok, true);
+  const m = calls.sendMedia[0];
+  assert.equal(m.kind, 'document');
+  assert.equal(m.mimeType, 'text/plain');
+  assert.ok(m.data.startsWith('data:text/plain;base64,'));
+});
+
 test('reply: a send failure marks the row failed and returns ok:false', async () => {
   const { td, db } = harness({ failOn: 'sendText' });
   const r = await td({ sessionKey: 'g@g.us', chatId: 'g@g.us', toolName: 'reply', text: 'hi' });
