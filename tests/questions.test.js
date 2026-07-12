@@ -108,6 +108,22 @@ test('parser matrix: number / punctuation / embedded / label / multiSelect / fre
   assert.equal(parseAnswer('', q).ok, false);
 });
 
+test('parser: free-text that merely CONTAINS an option label is NOT coerced onto it (allowOther)', () => {
+  const yn = { header: 'confirm', options: [{ label: 'Yes' }, { label: 'No' }] }; // allowOther default true
+  // "not sure" ⊃ "no" and "know" ⊃ "no" — must fall through to free-text, not select "No".
+  assert.deepEqual(parseAnswer('not sure', yn).answer, { header: 'confirm', selected: [], other: 'not sure' });
+  assert.deepEqual(parseAnswer("I don't know yet", yn).answer, { header: 'confirm', selected: [], other: "I don't know yet" });
+  // but a genuine prefix still matches, and an exact label still wins.
+  assert.deepEqual(parseAnswer('ye', yn).answer.selected, ['Yes'], 'prefix "ye" → Yes preserved');
+  assert.deepEqual(parseAnswer('no', yn).answer.selected, ['No'], 'exact "no" → No');
+});
+
+test('parser: a malformed option (null in the array) does not throw', () => {
+  const q = { header: 'h', options: [{ label: 'A' }, null] };
+  assert.doesNotThrow(() => parseAnswer('A', q));
+  assert.deepEqual(parseAnswer('A', q).answer.selected, ['A']);
+});
+
 // ── sweep = the sole DM anti-wedge ───────────────────────────────────────────
 test('sweep: an open question older than timeout → answerQuestion({timedout:true}) + row expired', () => {
   const h = harness();
