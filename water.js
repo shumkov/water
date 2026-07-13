@@ -21,6 +21,7 @@ const { createGate } = require('./lib/handlers/gate');
 const { createDispatcher } = require('./lib/handlers/dispatcher');
 const { createChannelsToolDispatcher } = require('./lib/process/channels-tool-dispatcher');
 const { createFeedback } = require('./lib/feedback/feedback');
+const { createQuestions } = require('./lib/handlers/questions');
 const { chunkMarkdownText } = require('./lib/delivery/chunk');
 const { toWhatsApp } = require('./lib/delivery/format');
 const { WATER_DISPLAY_HINT } = require('./lib/delivery/display-hint');
@@ -102,6 +103,9 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
   // orchestra ProcessManager callbacks drive the reaction cascade: turn-start/thinking →
   // 🤔, tool-use → tool face, subagent → 👾. Re-wired on every spawn (respawn-safe). The
   // callback signature is (sessionKey, ...payload, proc); tool-use's payload is the toolName.
+  // Late-bound: the questions handler is created after the dispatcher (it needs the
+  // dispatcher's in-flight-sender map), but the PM callbacks + gate below reference it.
+  let questions = null;
   const pm = new ProcessManager({
     processFactory: factory, budget: acc.processBudget || 9, logger,
     callbacks: {
@@ -110,6 +114,7 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
       onToolUse:       (sk, toolName) => feedback.onEvent(sk, 'tool-use', toolName),
       onSubagentStart: (sk, p) => feedback.onEvent(sk, 'subagent-start', p),
       onSubagentDone:  (sk, p) => feedback.onEvent(sk, 'subagent-done', p),
+      onQuestionAsked: (sk, p) => questions?.onAsked(sk, p),   // `ask` tool (docs/ASK_SPEC.md)
     },
   });
 
@@ -123,6 +128,7 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
   const gate = createGate({
     resolveChat: resolve, jidMap, botIdentity, adminJids: acc.adminJids || [],
     allowConfigCommands: acc.allowConfigCommands === true,
+    hasOpenQuestionFor: (chatJid, senderJid) => (questions ? questions.isOpenFor(chatJid, senderJid) : false),
   });
 
   async function deliverFallback(msg, text) {
@@ -162,6 +168,17 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
     mediaMaxBytes: (acc.mediaMaxMb || 32) * 1024 * 1024, logEvent, logger,
   });
 
+  // `ask` tool (docs/ASK_SPEC.md): DM-only real questions, group asks degrade non-blocking.
+  questions = createQuestions({
+    db, pm, jidMap,
+    deliver: (chatJid, text) => toolDispatcher({ sessionKey: chatJid, chatId: chatJid, toolName: 'reply', text }),
+    inFlightSender: (sk) => dispatcher.inFlightSender(sk),
+    logEvent, logger,
+  });
+  // Boot: any 'open' question is a prior-life orphan (its bridge promise died with the old
+  // process). Expire it WITHOUT answering, so it can't swallow a future message.
+  questions.expireOrphansAtBoot();
+
   // Ops: escalation (-> polygram IPC -> Telegram), SLA + transport watchdogs, heartbeat.
   const esc = acc.escalation || {};
   const escalator = createEscalator({ ipcBot: esc.ipcBot, chatId: esc.chatId, quietHours: esc.quietHours, logEvent, logger });
@@ -195,13 +212,21 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
         return dispatcher.dispatch(msg.chatJid, msg, row, { isReplay }).catch((e) => logger.error?.('dispatch', e?.message));
       case 'abort':
         try { await pm.procs?.get(msg.chatJid)?.interrupt?.(); } catch { /* */ }
+        questions.expireChat(msg.chatJid);   // an interrupt frees the lock but leaves the row open
         return status.markAborted(rowId);
       case 'ignore':
         return status.markIgnored(rowId, d.reason);
       case 'command':
-      case 'consume':
-        // v1: config commands / question-consume are recorded; full handling is 1b-D.
-        return status.markIgnored(rowId, d.action);
+        // v1: config commands are recorded; full handling is 1b-D.
+        return status.markIgnored(rowId, 'command');
+      case 'consume': {
+        // The reply answers an open `ask`. Resolve it via the SYNCHRONOUS questions.consume
+        // (→ pm.answerQuestion) RIGHT HERE — it MUST NOT go through dispatcher.dispatch: the
+        // wedged ask-turn holds lockFor(chat), so acquiring that lock in the answer path would
+        // deadlock. questions.consume never touches the lock (docs/ASK_SPEC.md §3.3).
+        const r = questions.consume(msg);
+        return status.markIgnored(rowId, r.ok ? 'answered-question' : 'question-reparse');
+      }
       default:
         return status.markIgnored(rowId, 'unhandled');
     }
@@ -340,6 +365,7 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
   let slaTimer = null;
   let pollTimer = null;
   let ambigTimer = null;
+  let questionTimer = null;
   async function start({ withTimers = true } = {}) {
     await learnIdentity();
     const pathToken = acc.webhook?.pathToken || 'water';
@@ -399,6 +425,9 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
         try { for (const r of outbound.sweepAmbiguous()) logEvent('ambiguous-send', { chatJid: r.chat_jid, msgId: r.msg_id }); }
         catch (e) { logger.error?.('ambig-sweep', e?.message); }
       }, 30_000); ambigTimer.unref?.();
+      // `ask` timeout sweep — the SOLE anti-wedge for a DM ask (the daemon defers its own
+      // turn-timeout while a question is open, so this frees a stuck DM turn + its lock).
+      questionTimer = setInterval(() => { try { questions.sweep(); } catch (e) { logger.error?.('question-sweep', e?.message); } }, 30_000); questionTimer.unref?.();
     }
     return { port: addr.port };
   }
@@ -407,6 +436,7 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
     if (slaTimer) clearInterval(slaTimer);
     if (pollTimer) clearInterval(pollTimer);
     if (ambigTimer) clearInterval(ambigTimer);
+    if (questionTimer) clearInterval(questionTimer);
     heartbeat.stop();
     if (receiver) await receiver.close();
     try { ipc?.close?.(); } catch { /* */ }
