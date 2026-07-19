@@ -35,6 +35,12 @@ const { createTransportWatchdog } = require('./lib/ops/transport-watchdog');
 const { createHeartbeat } = require('./lib/ops/heartbeat');
 const ipcServer = require('./lib/ipc/server');
 
+// Per-sender cap on the restricted-DM canned reply: at most one send per sender in this
+// rolling window. In-memory only (not persisted) — a safety cap against an auto-responder
+// loop or a DM flood, not a product knob, so a restart resetting it is an acceptable
+// residual (worst case one extra reply per sender, never an unbounded loop).
+const RESTRICTED_DM_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 // The webhook URL water registers with WuzAPI, plus the prefix used to recognise a "foreign"
 // webhook it must not clobber. Defaults to the loopback bind; webhook.advertiseHost lets a
 // Docker-networked deployment advertise a bridge-gateway address the WuzAPI container can
@@ -125,10 +131,31 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
   // Bot identity set {pn, lid} for mention detection; learned at boot from the session.
   let botIdentity = injectedBotIdentity || new Set();
 
+  // Opt-in canned reply for non-allowlisted DMs (see restrictedReply below). Absent/empty
+  // config ⇒ disabled, full back-compat with today's silent drop.
+  const dmRestrictedReply = acc.dmRestrictedReply;
+  const restrictedDmEnabled = typeof dmRestrictedReply === 'string' && dmRestrictedReply.length > 0;
+  const restrictedDmSeenAt = new Map(); // 'chatJid|canonical-identity' -> last-reply ts (see RESTRICTED_DM_WINDOW_MS)
+  // Resolve through jidMap's identity set (like authorize()/isAdmin elsewhere in the
+  // gate) so the same person addressed once as a pn and once as a lid still shares one
+  // cap entry, instead of getting a fresh allowance under each form.
+  function restrictedDmKey(chatJid, senderJid) {
+    const identity = [...jidMap.identitySet(senderJid)].sort()[0];
+    return `${chatJid}|${identity}`;
+  }
+  function hasRecentRestrictedReply(chatJid, senderJid) {
+    const seenAt = restrictedDmSeenAt.get(restrictedDmKey(chatJid, senderJid));
+    return seenAt !== undefined && Date.now() - seenAt < RESTRICTED_DM_WINDOW_MS;
+  }
+  function markRestrictedDmReplied(chatJid, senderJid) {
+    restrictedDmSeenAt.set(restrictedDmKey(chatJid, senderJid), Date.now());
+  }
+
   const gate = createGate({
     resolveChat: resolve, jidMap, botIdentity, adminJids: acc.adminJids || [],
     allowConfigCommands: acc.allowConfigCommands === true,
     hasOpenQuestionFor: (chatJid, senderJid) => (questions ? questions.isOpenFor(chatJid, senderJid) : false),
+    restrictedDmEnabled, hasRecentRestrictedReply,
   });
 
   async function deliverFallback(msg, text) {
@@ -136,6 +163,11 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
   }
   async function errorReply(msg, text) {
     await toolDispatcher({ sessionKey: msg.chatJid, chatId: msg.chatJid, toolName: 'reply', text });
+  }
+  // Canned "DMs aren't monitored" note for a non-allowlisted DM (gate action
+  // 'restricted-dm'): no Claude turn, just the reply path — identical shape to errorReply.
+  async function restrictedReply(msg) {
+    await toolDispatcher({ sessionKey: msg.chatJid, chatId: msg.chatJid, toolName: 'reply', text: dmRestrictedReply });
   }
   const attachmentsFor = (row) => db.prepare('SELECT * FROM attachments WHERE message_id=?').all(row.id);
 
@@ -216,6 +248,18 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
         return status.markAborted(rowId);
       case 'ignore':
         return status.markIgnored(rowId, d.reason);
+      case 'restricted-dm':
+        // Canned "DMs aren't monitored" note. Skip on boot replay (the sender already
+        // got it live; a restart must not re-blast old DMs). Mark the sender BEFORE the
+        // send so a burst of near-simultaneous messages can't all slip past the cap.
+        // Send is best-effort; the row is terminal either way so it can't replay or trip
+        // the SLA.
+        if (!isReplay) {
+          markRestrictedDmReplied(msg.chatJid, msg.sender.jid);
+          try { await restrictedReply(msg); }
+          catch (e) { logger.error?.('restricted-dm reply', e?.message); }
+        }
+        return status.markIgnored(rowId, 'restricted-dm');
       case 'command':
         // v1: config commands are recorded; full handling is 1b-D.
         return status.markIgnored(rowId, 'command');

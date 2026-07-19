@@ -23,6 +23,7 @@
         "en": "Hi! We're on it — a human will follow up shortly. – UMI",
         "th": "สวัสดีค่ะ ทีมงานกำลังดำเนินการ เดี๋ยวมีเจ้าหน้าที่ติดต่อกลับนะคะ – UMI"
       },
+      "dmRestrictedReply": "👋 Hi! This is UMI's assistant — direct messages here aren't monitored for support. Please reach our team at https://umi.store/pages/contact and we'll be glad to help.",
       "voice": { "enabled": true, "provider": "openai" },
       "feedback": {
         "typing": { "enabled": false },

@@ -28,6 +28,28 @@ function harness(chatConfig, { adminJids = [], seedPairs = [], allowConfigComman
   return { gate, jidMap };
 }
 
+// An unconfigured (not-on-the-allowlist) DM/group message — resolveChat returns null for
+// any JID other than GROUP/an @s.whatsapp.net DM whitelisted by harness's chatConfig, so use
+// a plain unconfigured JID here.
+function strangerDm(over = {}) {
+  return {
+    chatJid: 'stranger@s.whatsapp.net', chatType: 'dm', msgId: 'M', isFromMe: false,
+    sender: { jid: 'stranger@s.whatsapp.net', pn: 'stranger@s.whatsapp.net', lid: null, pushName: 'Stranger' },
+    text: 'hi is anyone there', mentions: [], attachments: [], ...over,
+  };
+}
+
+function gateWithRestrictedDm(opts = {}) {
+  const db = openDb(path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'water-gate-rdm-')), 't.db'));
+  const jidMap = createJidMap(db);
+  jidMap.seed({ pn: BOT_PN, lid: BOT_LID, ts: 1 });
+  return createGate({
+    resolveChat: () => null, // nothing is configured — every chat is a stranger
+    jidMap, botIdentity: new Set([jidMap.bareJid(BOT_PN), jidMap.bareJid(BOT_LID)]),
+    ...opts,
+  });
+}
+
 function groupMsg(over = {}) {
   return {
     chatJid: GROUP, chatType: 'group', msgId: 'M', isFromMe: false,
@@ -57,6 +79,42 @@ test('unknown chat → ignore(unknown-chat)', () => {
   const { gate } = harness({ requireMention: true });
   const d = gate.decide({ ...groupMsg(), chatJid: 'other@g.us' });
   assert.deepEqual(d, { action: 'ignore', reason: 'unknown-chat', sessionKey: undefined });
+});
+
+test('unconfigured DM + restrictedDmEnabled → restricted-dm', () => {
+  const gate = gateWithRestrictedDm({ restrictedDmEnabled: true });
+  const d = gate.decide(strangerDm());
+  assert.deepEqual(d, { action: 'restricted-dm', sessionKey: 'stranger@s.whatsapp.net' });
+});
+
+test('unconfigured DM + restrictedDmEnabled:false → ignore(unknown-chat) (default, back-compat)', () => {
+  const gate = gateWithRestrictedDm({});
+  const d = gate.decide(strangerDm());
+  assert.deepEqual(d, { action: 'ignore', reason: 'unknown-chat', sessionKey: undefined });
+});
+
+test('unconfigured GROUP + restrictedDmEnabled → still a silent drop, never restricted-dm', () => {
+  const gate = gateWithRestrictedDm({ restrictedDmEnabled: true });
+  const d = gate.decide({ ...strangerDm(), chatJid: 'stranger@g.us', chatType: 'group' });
+  assert.deepEqual(d, { action: 'ignore', reason: 'unknown-chat', sessionKey: undefined });
+});
+
+test('unconfigured DM that isFromMe + restrictedDmEnabled → not restricted (self-guard)', () => {
+  const gate = gateWithRestrictedDm({ restrictedDmEnabled: true });
+  const d = gate.decide(strangerDm({ isFromMe: true }));
+  assert.deepEqual(d, { action: 'ignore', reason: 'unknown-chat', sessionKey: undefined });
+});
+
+test('unconfigured DM already replied recently → ignore(restricted-dm-capped), not a second send', () => {
+  const gate = gateWithRestrictedDm({ restrictedDmEnabled: true, hasRecentRestrictedReply: () => true });
+  const d = gate.decide(strangerDm());
+  assert.deepEqual(d, { action: 'ignore', reason: 'restricted-dm-capped', sessionKey: 'stranger@s.whatsapp.net' });
+});
+
+test('configured DM/group unaffected by restrictedDmEnabled (dispatch paths unchanged)', () => {
+  const { gate } = harness({ requireMention: true });
+  const d = gate.decide({ ...groupMsg(), chatJid: 'x@s.whatsapp.net', chatType: 'dm' });
+  assert.equal(d.action, 'dispatch');
 });
 
 test('isFromMe → ignore(is-from-me)', () => {
