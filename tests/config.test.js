@@ -96,6 +96,19 @@ test('rejects an unknown feedback.ackReaction key (typo)', () => {
   assert.throws(() => validateConfig(c), /only dm\/group/);
 });
 
+test('rejects a non-string dmRestrictedReply', () => {
+  const c = base();
+  c.accounts.umi.dmRestrictedReply = 123;
+  assert.throws(() => validateConfig(c), /dmRestrictedReply must be a string/);
+});
+
+test('dmRestrictedReply absent or a string both pass (opt-in, disabled by default)', () => {
+  assert.doesNotThrow(() => validateConfig(base()));
+  const c = base();
+  c.accounts.umi.dmRestrictedReply = 'DMs are not monitored, see our contact page.';
+  assert.doesNotThrow(() => validateConfig(c));
+});
+
 test('scopeToAccount narrows chats to the account', () => {
   const c = base();
   c.accounts.other = { wuzapi: { baseUrl: 'x' }, webhook: { port: 8091 } };

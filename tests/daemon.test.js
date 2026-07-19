@@ -62,6 +62,27 @@ function daemon(dataDir, sent) {
   return d;
 }
 
+// A stranger DM: not in `chats`, so resolveChat -> null (unconfigured).
+const STRANGER_DM = 'stranger@s.whatsapp.net';
+function strangerDmMsg(over = {}) {
+  return {
+    chatJid: STRANGER_DM, chatType: 'dm', msgId: 'SD1', isFromMe: false,
+    sender: { jid: STRANGER_DM, altJid: null, pn: STRANGER_DM, lid: null, pushName: 'Stranger' },
+    tsMs: 1000, receivedAtMs: 1000, text: 'hello, is this UMI?', mentions: [], attachments: [], ...over,
+  };
+}
+
+function daemonWithRestrictedReply(dataDir, sent, replyText = "DMs aren't monitored here.") {
+  const cfg = baseConfig(dataDir);
+  cfg.accounts.umi.dmRestrictedReply = replyText;
+  const d = createDaemon({
+    config: cfg, account: 'umi', dataDir,
+    transport: mkTransport(sent), botIdentity: new Set([BOT_PN]),
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  return d;
+}
+
 test('unaddressed group message is recorded and ignored(unaddressed), no turn', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-d1-'));
   const sent = [];
@@ -136,6 +157,152 @@ test('dispatch failure marks the row failed and calls the error reply (not on re
   await new Promise((r) => setTimeout(r, 30));
   const row = d.db.prepare("SELECT handler_status FROM messages WHERE msg_id='F1'").get();
   assert.equal(row.handler_status, 'failed');
+  await d.stop();
+});
+
+test('restricted-dm: a non-allowlisted DM sends exactly one canned reply and marks the row ignored', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-rdm1-'));
+  const sent = [];
+  const d = daemonWithRestrictedReply(dir, sent, 'We do not monitor DMs here.');
+  await d.onMessage(strangerDmMsg());
+  await new Promise((r) => setTimeout(r, 20));
+  const row = d.db.prepare("SELECT handler_status, error FROM messages WHERE msg_id='SD1'").get();
+  assert.equal(row.handler_status, 'ignored');
+  assert.equal(row.error, 'restricted-dm');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].text, 'We do not monitor DMs here.');
+  assert.equal(sent[0].chatJid, STRANGER_DM);
+  await d.stop();
+});
+
+test('restricted-dm: absent config keeps the silent drop (back-compat, no send)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-rdm2-'));
+  const sent = [];
+  const d = daemon(dir, sent); // baseConfig has no dmRestrictedReply
+  await d.onMessage(strangerDmMsg());
+  await new Promise((r) => setTimeout(r, 20));
+  const row = d.db.prepare("SELECT handler_status, error FROM messages WHERE msg_id='SD1'").get();
+  assert.equal(row.handler_status, 'ignored');
+  assert.equal(row.error, 'unknown-chat');
+  assert.equal(sent.length, 0);
+  await d.stop();
+});
+
+test('restricted-dm: replay skips the send but still marks the row ignored', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-rdm3-'));
+  const sent = [];
+  const d = daemonWithRestrictedReply(dir, sent);
+  const ins = d.db.prepare(`INSERT INTO messages (chat_jid,msg_id,sender_jid,user,text,direction,account,ts,received_at)
+                VALUES (?,?,?,?,?,?,?,?,?)`).run(STRANGER_DM, 'SD-replay', STRANGER_DM, 'Stranger', 'hi again', 'in', 'umi', Date.now(), Date.now());
+  await d.processInbound(strangerDmMsg({ msgId: 'SD-replay' }), ins.lastInsertRowid, { isReplay: true });
+  const row = d.db.prepare("SELECT handler_status, error FROM messages WHERE msg_id='SD-replay'").get();
+  assert.equal(row.handler_status, 'ignored');
+  assert.equal(row.error, 'restricted-dm');
+  assert.equal(sent.length, 0, 'boot replay must never re-blast an old DM');
+  await d.stop();
+});
+
+test('restricted-dm: a throwing send is swallowed and the row is still marked ignored (no leak)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-rdm4-'));
+  const sent = [];
+  const d = daemonWithRestrictedReply(dir, sent);
+  d._internal.transport.sendText = async () => { throw new Error('wuzapi down'); };
+  await d.onMessage(strangerDmMsg());
+  await new Promise((r) => setTimeout(r, 20));
+  const row = d.db.prepare("SELECT handler_status, error FROM messages WHERE msg_id='SD1'").get();
+  assert.equal(row.handler_status, 'ignored');
+  assert.equal(row.error, 'restricted-dm');
+  await d.stop();
+});
+
+test('restricted-dm: a second message from the same sender within the window is capped (no second send)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-rdm5-'));
+  const sent = [];
+  const d = daemonWithRestrictedReply(dir, sent);
+  await d.onMessage(strangerDmMsg({ msgId: 'SD-a' }));
+  await new Promise((r) => setTimeout(r, 20));
+  await d.onMessage(strangerDmMsg({ msgId: 'SD-b', text: 'still there?' }));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(sent.length, 1, 'only the first message in the window gets a reply');
+  const row = d.db.prepare("SELECT handler_status, error FROM messages WHERE msg_id='SD-b'").get();
+  assert.equal(row.handler_status, 'ignored');
+  assert.equal(row.error, 'restricted-dm-capped');
+  await d.stop();
+});
+
+test('restricted-dm cap resolves pn/lid identity: same person via two JID forms shares one cap', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-rdm6-'));
+  const sent = [];
+  const d = daemonWithRestrictedReply(dir, sent);
+  const PN = 'stranger2@s.whatsapp.net';
+  const LID = 'stranger2@lid';
+  // First message: sender attributed by pn, with the lid alt form present — this is how
+  // jidMap.observeSender (called for every inbound message) learns the pn<->lid pair.
+  await d.onMessage(strangerDmMsg({
+    msgId: 'ID-1', chatJid: PN,
+    sender: { jid: PN, altJid: LID, pn: PN, lid: LID, pushName: 'Stranger2' },
+  }));
+  await new Promise((r) => setTimeout(r, 20));
+  // Second message: same real person, now attributed purely by lid (addressing-mode
+  // quirk) — the cap must still recognize them as already-replied via identitySet.
+  await d.onMessage(strangerDmMsg({
+    msgId: 'ID-2', chatJid: PN, text: 'hello again',
+    sender: { jid: LID, altJid: null, pn: null, lid: LID, pushName: 'Stranger2' },
+  }));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(sent.length, 1, 'same person via pn then lid must share the cap, not get a second reply');
+  assert.equal(d.db.prepare("SELECT error FROM messages WHERE msg_id='ID-2'").get().error, 'restricted-dm-capped');
+  await d.stop();
+});
+
+test('restricted-dm cap is per-sender: a second, distinct stranger still gets their own reply', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-rdm10-'));
+  const sent = [];
+  const d = daemonWithRestrictedReply(dir, sent);
+  await d.onMessage(strangerDmMsg({ msgId: 'S1' }));
+  await new Promise((r) => setTimeout(r, 20));
+  const OTHER = 'other-stranger@s.whatsapp.net';
+  await d.onMessage(strangerDmMsg({
+    msgId: 'S2', chatJid: OTHER,
+    sender: { jid: OTHER, altJid: null, pn: OTHER, lid: null, pushName: 'Other' },
+  }));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(sent.length, 2, 'the cap must be keyed per sender, not shared/global');
+  await d.stop();
+});
+
+test('restricted-dm: mark-before-send prevents a race — two near-simultaneous messages from the same sender only get one send', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-rdm7-'));
+  const sent = [];
+  const d = daemonWithRestrictedReply(dir, sent);
+  const p1 = d.onMessage(strangerDmMsg({ msgId: 'RACE1' }));
+  const p2 = d.onMessage(strangerDmMsg({ msgId: 'RACE2', text: 'still here?' }));
+  await Promise.all([p1, p2]);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(sent.length, 1, 'marking before the await must block the second message before its send fires');
+  await d.stop();
+});
+
+test('restricted-dm: empty-string dmRestrictedReply is treated as disabled (silent drop, no send)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-rdm8-'));
+  const sent = [];
+  const d = daemonWithRestrictedReply(dir, sent, '');
+  await d.onMessage(strangerDmMsg());
+  await new Promise((r) => setTimeout(r, 20));
+  const row = d.db.prepare("SELECT handler_status, error FROM messages WHERE msg_id='SD1'").get();
+  assert.equal(row.handler_status, 'ignored');
+  assert.equal(row.error, 'unknown-chat');
+  assert.equal(sent.length, 0);
+  await d.stop();
+});
+
+test('restricted-dm: no turn_metrics row is created (no session/turn, per spec)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-rdm9-'));
+  const sent = [];
+  const d = daemonWithRestrictedReply(dir, sent);
+  await d.onMessage(strangerDmMsg());
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(d.db.prepare('SELECT COUNT(*) c FROM turn_metrics').get().c, 0);
   await d.stop();
 });
 
