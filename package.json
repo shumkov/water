@@ -1,6 +1,6 @@
 {
   "name": "watergram",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "WhatsApp daemon for Claude Code — one interactive Claude session per WhatsApp chat, over WuzAPI (whatsmeow), with polygram's reliability architecture.",
   "type": "commonjs",
   "bin": {
