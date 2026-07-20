@@ -45,7 +45,10 @@ test('reply: sends chunks, quote only on the first, returns first msgId, write-b
   assert.equal(r.ok, true);
   assert.ok(r.message_id, 'returns first bubble id');
   assert.equal(calls.sendText.length, 2, 'two chunks sent');
-  assert.ok(calls.sendText[0].quote, 'first chunk quotes the user message');
+  // Pin the exact quote shape the dispatcher hands the transport — a rename of the
+  // participant field on the read side would otherwise leave `quote` truthy-but-broken
+  // and this suite green while production drops the ContextInfo (Seam B).
+  assert.deepEqual(calls.sendText[0].quote, { msgId: 'U1', participantJid: 'p@s.whatsapp.net' }, 'first chunk quotes with both fields');
   assert.equal(calls.sendText[1].quote, undefined, 'later chunks do not quote');
   // write-before-send: two out rows, both flipped to sent
   const rows = db.prepare("SELECT status FROM messages WHERE direction='out'").all();
@@ -130,6 +133,16 @@ test('react routes to transport.react (remove when text null)', async () => {
   assert.equal(calls.react[0].emoji, '👍');
   await td({ sessionKey: 'g@g.us', chatId: 'g@g.us', toolName: 'react', messageId: 'M1', text: '' });
   assert.equal(calls.react[1].emoji, null);
+});
+
+test('react carries participantJid only when reacting to THIS turn\'s source message', async () => {
+  const { td, calls } = harness();
+  // Reacting to the turn's source message → participant is that message's author.
+  await td({ sessionKey: 'g@g.us', chatId: 'g@g.us', toolName: 'react', messageId: 'M1', text: '👍', sourceMsgId: 'M1', participantJid: 'a@lid' });
+  assert.equal(calls.react[0].participantJid, 'a@lid');
+  // Reacting to a DIFFERENT message → we don't know its author, so no participant (never mislabel).
+  await td({ sessionKey: 'g@g.us', chatId: 'g@g.us', toolName: 'react', messageId: 'OTHER', text: '👍', sourceMsgId: 'M1', participantJid: 'a@lid' });
+  assert.equal(calls.react[1].participantJid, undefined);
 });
 
 test('unsupported tool → ok:false', async () => {

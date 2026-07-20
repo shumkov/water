@@ -48,6 +48,20 @@ test('sendText includes ContextInfo for a quote + mentions', async () => {
   assert.deepEqual(ci.MentionedJID, ['m@s.whatsapp.net']);
 });
 
+test('sendText omits ContextInfo for a half-built quote (WuzAPI 500-panics on StanzaID without Participant)', async () => {
+  // StanzaID without a participant must NOT produce a partial ContextInfo — WuzAPI
+  // dereferences Participant unconditionally when StanzaID is set → nil panic → HTTP 500.
+  let fetchImpl = mockFetch({ data: { Id: 'x' } });
+  const t1 = createTransport({ baseUrl: 'http://h', userToken: 'u', fetchImpl });
+  await t1.sendText({ chatJid: 'g@g.us', text: 'yo', quote: { msgId: 'Q1' } });
+  assert.equal(fetchImpl.calls[0].body.ContextInfo, undefined, 'no ContextInfo when participant missing');
+  // symmetric: participant without a stanza id is not a quote either
+  fetchImpl = mockFetch({ data: { Id: 'x' } });
+  const t2 = createTransport({ baseUrl: 'http://h', userToken: 'u', fetchImpl });
+  await t2.sendText({ chatJid: 'g@g.us', text: 'yo', quote: { participantJid: 'p@s.whatsapp.net' } });
+  assert.equal(fetchImpl.calls[0].body.ContextInfo, undefined, 'no ContextInfo when stanza id missing');
+});
+
 test('sendMedia document sets FileName and Document field', async () => {
   const fetchImpl = mockFetch({ data: { Id: 'd1' } });
   const t = createTransport({ baseUrl: 'http://h', userToken: 'u', fetchImpl });
