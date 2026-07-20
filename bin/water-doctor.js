@@ -50,6 +50,15 @@ async function run({ account, configPath, dataDir }) {
     add('heartbeat', ageS < 300, `${Math.round(ageS)}s old`);
   } catch { add('heartbeat', false, 'heartbeat.json missing (daemon not running?)'); }
 
+  // auth-disabled (SPEC: docs/AUTH_DISABLED_HANDLING_SPEC.md) — heartbeat.json's authDisabled
+  // counter is not by itself netdata-visible (/healthz's 200/503 is staleness-only, not
+  // field-based), so this check's non-zero exit is what actually makes the 5-min cron page.
+  try {
+    const hb = JSON.parse(fs.readFileSync(path.join(dataDir, 'heartbeat.json'), 'utf8'));
+    const n = Number(hb.authDisabled) || 0;
+    add('auth-disabled', n === 0, n === 0 ? 'no recent auth-disabled outage' : `${n} auth-disabled turn(s) in the last hour — Claude Code access may be disabled, check the Anthropic Console`);
+  } catch { add('auth-disabled', false, 'heartbeat.json missing/unreadable (daemon not running?)'); }
+
   // wuzapi reachability (best-effort; loopback)
   try {
     const { createTransport } = require('../lib/transport/client');

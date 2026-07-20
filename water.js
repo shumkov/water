@@ -33,6 +33,7 @@ const { createEscalator } = require('./lib/ops/escalate');
 const { createSlaWatchdog } = require('./lib/ops/sla-watchdog');
 const { createTransportWatchdog } = require('./lib/ops/transport-watchdog');
 const { createHeartbeat } = require('./lib/ops/heartbeat');
+const { createAuthDisabledGate } = require('./lib/ops/auth-disabled-gate');
 const ipcServer = require('./lib/ipc/server');
 
 // The webhook URL water registers with WuzAPI, plus the prefix used to recognise a "foreign"
@@ -162,10 +163,17 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
   }
   const att_dirsafe = (att) => String(att.message_id);
 
+  // Escalation (-> polygram IPC -> Telegram) is constructed here, ahead of the dispatcher,
+  // because the dispatcher's authDisabledGate dependency needs it.
+  const esc = acc.escalation || {};
+  const escalator = createEscalator({ ipcBot: esc.ipcBot, chatId: esc.chatId, quietHours: esc.quietHours, logEvent, logger });
+  const authDisabledGate = createAuthDisabledGate({ escalate: (sev, t) => escalator.escalate(sev, t), logEvent, logger });
+
   const dispatcher = createDispatcher({
     pm, sessions, status, resolveChat: resolve, defaults: scoped.defaults,
     deliverFallback, errorReply, classify, attachmentsFor, fetchMedia, feedback,
     mediaMaxBytes: (acc.mediaMaxMb || 32) * 1024 * 1024, logEvent, logger,
+    authDisabledGate,
   });
 
   // `ask` tool (docs/ASK_SPEC.md): DM-only real questions, group asks degrade non-blocking.
@@ -179,9 +187,7 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
   // process). Expire it WITHOUT answering, so it can't swallow a future message.
   questions.expireOrphansAtBoot();
 
-  // Ops: escalation (-> polygram IPC -> Telegram), SLA + transport watchdogs, heartbeat.
-  const esc = acc.escalation || {};
-  const escalator = createEscalator({ ipcBot: esc.ipcBot, chatId: esc.chatId, quietHours: esc.quietHours, logEvent, logger });
+  // Ops: SLA + transport watchdogs, heartbeat.
   const heartbeat = createHeartbeat({ db, dataDir, account });
   function holdingText(chatJid) {
     const chat = resolve(chatJid) || {};
