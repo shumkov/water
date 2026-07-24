@@ -90,12 +90,20 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
   });
 
   // Session engine: pinned+vendored claude, tmux, cli backend.
+  const sessionLauncher = process.env.ORCHESTRA_SESSION_LAUNCHER;
+  const requireExistingServer = process.env.ORCHESTRA_TMUX_REQUIRE_SERVER === '1';
+  logger.log?.(`[water] session containment configured: ${sessionLauncher ? 'yes' : 'no'}`);
   const vendored = ensureVendoredClaudeBin(CLAUDE_CLI_PINNED_VERSION);
   if (!vendored.ok) throw new Error(`water: claude binary unavailable: ${vendored.reason}`);
-  const tmuxRunner = createTmuxRunner({ logger, sessionPrefix: 'water' });
+  const tmuxRunner = createTmuxRunner({
+    logger,
+    sessionPrefix: 'water',
+    requireExistingServer,
+  });
   const factory = createProcessFactory({
     config: { chats: scoped.chats, bot: { pm: 'cli' } },
     tmuxRunner, botName: account, toolDispatcher, channelsClaudeBin: vendored.path, db, logger,
+    sessionLauncher,
     displayHint: WATER_DISPLAY_HINT,                         // orchestra: WhatsApp rendering rules
     maxOutboundFileBytes: (acc.mediaMaxMb || 100) * 1024 * 1024,
     // orchestra identity — water's names so the shared engine speaks WhatsApp.
