@@ -78,3 +78,48 @@ test('SESSION_PROCESS_LOST clears before guidance, never continues, and the next
     'the next process spawn must omit the stale --resume session id',
   );
 });
+
+test('SESSION_PROCESS_LOST reset failure preserves the original error and gives no false fresh-session promise', async () => {
+  const lost = Object.assign(new Error('contained process tree exited'), {
+    code: 'SESSION_PROCESS_LOST',
+  });
+  const events = [];
+  const replies = [];
+
+  const dispatcher = createDispatcher({
+    pm: {
+      procs: new Map(),
+      getOrSpawn: async () => {},
+      send: async () => { throw lost; },
+    },
+    sessions: {
+      resolveForSpawn: () => 'stale-session',
+      persist: () => {},
+      clearSession: () => { throw new Error('database unavailable'); },
+    },
+    status: {
+      markDispatched: () => {},
+      markReplied: () => {},
+      markFailed: () => {},
+      recordTurnMetric: () => {},
+    },
+    resolveChat: () => ({ cwd: '/tmp' }),
+    defaults: {},
+    classify,
+    errorReply: async (_msg, text) => { replies.push(text); },
+    logEvent: (type, fields) => events.push({ type, fields }),
+    logger: { error() {}, warn() {}, log() {} },
+  });
+
+  await assert.rejects(
+    () => dispatcher.dispatch(SESSION_KEY, message('M1'), { id: 1 }),
+    err => err === lost,
+  );
+  assert.equal(replies.length, 1);
+  assert.match(replies[0], /couldn't safely reset/i);
+  assert.match(replies[0], /\/reset/i);
+  assert.doesNotMatch(replies[0], /fresh session/i);
+  assert.ok(
+    events.some(event => event.type === 'session-reset-after-process-loss-failed'),
+  );
+});
