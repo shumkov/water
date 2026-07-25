@@ -22,6 +22,18 @@ test('AUTH_DISABLED: silence to the WhatsApp partner (userMessage null), non-tra
   assert.equal(r.autoRecover, null);
 });
 
+test('SESSION_PROCESS_LOST: calmly asks for a resend into a fresh session', () => {
+  const err = Object.assign(new Error('contained process tree exited'), {
+    code: 'SESSION_PROCESS_LOST',
+  });
+  const r = classify(err);
+  assert.equal(r.kind, 'sessionProcessLost');
+  assert.match(r.userMessage, /resend/i);
+  assert.match(r.userMessage, /fresh session/i);
+  assert.equal(r.isTransient, false);
+  assert.equal(r.autoRecover, null);
+});
+
 test('every CODES entry has the required shape', () => {
   for (const [code, shape] of Object.entries(CODES)) {
     assert.ok(typeof shape.kind === 'string', `CODES.${code}.kind`);
