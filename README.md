@@ -45,7 +45,7 @@ pieces — **WuzAPI** (the WhatsApp bridge), **water** (this daemon), and a **`c
 - **Docker** (to run WuzAPI).
 - A **WhatsApp account** + phone to link (WuzAPI is a linked-device bridge — you scan a QR).
 - **Claude auth for a headless host.** water auto-vendors a pinned `claude` binary
-  (`2.1.173`) on first boot, but the spawned `claude` still needs to authenticate. On a
+  (`2.1.220`) on first boot, but the spawned `claude` still needs to authenticate. On a
   server, generate a long-lived token with `claude setup-token` and export it (e.g. source
   it from the systemd unit) so subprocesses don't need the desktop keychain.
 
@@ -100,7 +100,7 @@ npm install                      # pulls @shumkov/orchestra (the shared engine)
 ```
 
 The pinned `claude` binary vendors automatically on first run into
-`~/.local/share/orchestra/claude-bin/2.1.173`. To point it elsewhere (or reuse an existing
+`~/.local/share/orchestra/claude-bin/2.1.220`. To point it elsewhere (or reuse an existing
 vendored copy), set `ORCHESTRA_CLAUDE_VENDOR_DIR`.
 
 ### 3. Configure — `config.json`

@@ -61,7 +61,7 @@ the network's message shape, delivery API, gate/policy, or persistence schema.
    diff (modulo the known constants) is the signal that extraction is still cheap.
    A growing diff is technical debt to pay down or consciously accept.
 5. **Don't fork the pinned claude version casually.** water and polygram should track
-   the same pinned CLI version (2.1.173) so the shared code's version-sensitive
+   the same pinned CLI version (2.1.220) so the shared code's version-sensitive
    assumptions stay identical — divergence here is the most expensive kind.
 
 ## Extraction trigger + target (later)
