@@ -371,7 +371,7 @@ input ledger, busy-aware ceilings, mid-turn dialog watchdog, interrupt — see
 glossary §18 for these terms) + channels bridge (per-session 0600 unix socket,
 single-shot secret auth, `notifications/claude/channel` injection with XML-escaped
 body/meta, `reply`/`react`/`edit_message`/`ask` tools, mcp-ready + bridge-ready
-handshake, ping/pong liveness) + claude-bin (pin **2.1.173**, vendor to
+handshake, ping/pong liveness) + claude-bin (pin **2.1.220**, vendor to
 `~/.local/share/water/claude-bin/`, self-heal at boot, per-bump E2E revalidation
 ritual — the single most important lesson carried over from polygram).
 

@@ -159,10 +159,19 @@ As a service (systemd):
 ```ini
 [Service]
 WorkingDirectory=/home/you/water
-Environment=ORCHESTRA_CLAUDE_VENDOR_DIR=/home/you/.local/share/orchestra/claude-bin
+Environment=ORCHESTRA_CLAUDE_VENDOR_DIR=/home/you/.local/share/water/claude-bin
 ExecStart=/usr/bin/node water.js --account umi --config /home/you/.water/config.json --dataDir /home/you/.water
 Restart=on-failure
 ```
+
+Give water its **own** vendor dir, as above — never one shared with another
+orchestra app. The vendor GC keeps only the version the starting app pins and
+deletes the rest, so two apps sharing a dir means whichever starts last wipes the
+other's CLI. The loser keeps spawning a path that no longer exists: `tmux
+new-session` still succeeds, the session dies in milliseconds with no pane output,
+and every turn fails in a way that looks like a Claude crash rather than a missing
+file. The default (`.../share/orchestra/claude-bin`) is shared by construction, so
+set this explicitly whenever more than one orchestra app runs on the host.
 
 ### 5. Verify
 
