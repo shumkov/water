@@ -406,6 +406,26 @@ test('deployment containment probe exercises and retires one real Water session 
   await d.stop();
 });
 
+test('deployment containment probe reserves the weighted budget of one CLI session', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-containment-budget-'));
+  const d = daemon(dir, []);
+  const proc = d._internal.containmentProbePm.processFactory(
+    'water-containment-probe',
+    {
+      runtime: 'claude',
+      label: 'containment-probe',
+      cwd: dir,
+    },
+  );
+
+  assert.ok(
+    d._internal.containmentProbePm.budget >= proc.cost,
+    'a lower budget waits forever before spawning its only CLI process',
+  );
+
+  await d.stop();
+});
+
 test('replacement daemon retires a pre-spawn-intent probe after external session creation', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-containment-recovery-'));
   const previous = {
