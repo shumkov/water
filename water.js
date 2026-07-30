@@ -13,6 +13,7 @@ const { loadConfig, scopeToAccount, resolveChat } = require('./lib/config');
 const { openDb } = require('./lib/db');
 const { createTransport } = require('./lib/transport/client');
 const { createReceiver } = require('./lib/transport/webhook-receiver');
+const { normalize } = require('./lib/transport/normalize');
 const { createOutbound } = require('./lib/db/outbound');
 const { createJidMap } = require('./lib/db/jid-map');
 const { createSessions } = require('./lib/db/sessions');
@@ -159,7 +160,13 @@ function createDaemon({
   });
 
   function logEvent(kind, detail) {
-    try { db.prepare('INSERT INTO events (ts, chat_jid, kind, detail_json) VALUES (?,?,?,?)').run(Date.now(), detail?.chatJid || detail?.chat_jid || null, kind, JSON.stringify(detail || {})); } catch { /* best effort */ }
+    try {
+      const result = db.prepare('INSERT INTO events (ts, chat_jid, kind, detail_json) VALUES (?,?,?,?)')
+        .run(Date.now(), detail?.chatJid || detail?.chat_jid || null, kind, JSON.stringify(detail || {}));
+      return Number(result.lastInsertRowid);
+    } catch {
+      return null;
+    }
   }
 
   // Bot identity set {pn, lid} for mention detection; learned at boot from the session.
@@ -357,8 +364,23 @@ function createDaemon({
     if (msg.edit?.targetMsgId) {
       const target = msg.edit.targetMsgId;
       try {
-        db.prepare('UPDATE messages SET text=@text, edited_ts=@ts WHERE chat_jid=@chat AND msg_id=@target')
-          .run({ text: msg.text ?? null, ts: msg.tsMs, chat: msg.chatJid, target });
+        db.prepare(`
+          UPDATE messages
+             SET text=@text,
+                 raw_json=@rawJson,
+                 quote_msg_id=@quoteMsgId,
+                 quote_participant=@quoteParticipant,
+                 edited_ts=@ts
+           WHERE chat_jid=@chat AND msg_id=@target
+        `).run({
+          text: msg.text ?? null,
+          rawJson: msg.rawJson ?? null,
+          quoteMsgId: msg.quote?.msgId ?? null,
+          quoteParticipant: msg.quote?.participantJid ?? null,
+          ts: msg.tsMs,
+          chat: msg.chatJid,
+          target,
+        });
       } catch (e) { logger.error?.('record edit', e?.message); }
       logEvent('inbound-edit', { chatJid: msg.chatJid, target });
 
@@ -483,9 +505,11 @@ function createDaemon({
   //  - `received` rows (never gated) ALWAYS re-gate — no turn ever started, so no dup.
   //  - `dispatched`/`replay-pending` rows (a turn had started): crash → recover;
   //    clean restart → skip (they were drained at shutdown, not lost).
-  // Completion is gated on turn_metrics OR a delivered bot-reply after the inbound
-  // (an out-row source='bot-reply' status='sent' ts >= inbound ts). Candidates
-  // shadowed by a newer authorized abort are dropped (never resurrect a killed turn).
+  // A delivered bot-reply after the inbound is the only replay-suppression evidence
+  // (an out-row source='bot-reply' status='sent' ts >= inbound ts). A success metric can
+  // precede fallback delivery, so it cannot make a nonterminal row safe to skip.
+  // Candidates shadowed by a newer authorized abort are dropped (never resurrect a
+  // killed turn).
   const readCleanShutdown = db.prepare("SELECT v FROM daemon_state WHERE k='clean_shutdown_at'");
   const clearCleanShutdown = db.prepare("DELETE FROM daemon_state WHERE k='clean_shutdown_at'");
   const newerAbort = db.prepare("SELECT text, sender_jid, chat_jid FROM messages WHERE chat_jid=? AND direction='in' AND ts>? ");
@@ -497,11 +521,15 @@ function createDaemon({
     let cleanRestart = false;
     try { const m = readCleanShutdown.get(); cleanRestart = !!(m && m.v); clearCleanShutdown.run(); }
     catch { cleanRestart = false; } // any ambiguity → treat as crash → recover
-    let replayed = 0, skipped = 0;
+    let replayed = 0, skipped = 0, failed = 0;
     for (const r of status.replayCandidates(cutoff)) {
       const startedTurn = r.handler_status === 'dispatched' || r.handler_status === 'replay-pending';
-      // completion: a metrics row OR a delivered reply after this inbound
-      if (status.hasCompletedTurn(r.chat_jid, r.msg_id) || botReplyAfterIn.get(r.chat_jid, r.ts)) { status.markReplaySkipped(r.id); continue; }
+      // A metrics row can be written before fallback delivery. Only durable reply
+      // evidence may suppress a still-nonterminal replay candidate.
+      if (botReplyAfterIn.get(r.chat_jid, r.ts)) {
+        status.markReplaySkipped(r.id);
+        continue;
+      }
       // clean restart: a turn that had started was drained, not lost — skip it.
       if (startedTurn && cleanRestart) { status.markReplaySkipped(r.id); skipped++; continue; }
       // never resurrect a turn the user explicitly aborted after this message.
@@ -512,21 +540,58 @@ function createDaemon({
         const admission = await runAdmitted(
           { kind: 'boot-replay', owner: r.chat_jid, rowId: r.id },
           async (token) => {
-            status.markReplayAttempted(r.id);
             await processInbound(msg, r.id, { isReplay: true, shutdownToken: token });
           },
         );
         if (!admission.admitted) break;
         replayed++;
       } catch (e) {
+        status.markReplayPending(r.id);
+        failed++;
         logger.error?.('replay', e?.message);
       }
     }
     if (replayed || skipped) logger.log?.(`[water] boot replay: re-dispatched ${replayed}, skipped ${skipped} (${cleanRestart ? 'clean' : 'crash'} restart)`);
+    const unresolved = status.replayCandidates(cutoff).length;
+    if (failed || unresolved) {
+      logEvent('water-boot-replay-incomplete', { replayed, skipped, failed, unresolved });
+      const error = new Error(`water: boot replay incomplete (${failed} failed, ${unresolved} unresolved)`);
+      error.code = 'BOOT_REPLAY_INCOMPLETE';
+      throw error;
+    }
+    logEvent('water-boot-replay-complete', { replayed, skipped, failed: 0, unresolved: 0 });
+    return { replayed, skipped, failed: 0, unresolved: 0 };
   }
 
-  // Rebuild a minimal normalized message from a stored row for replay.
+  // Rebuild from the committed raw webhook so gate-relevant structured context
+  // (native mentions and edited quotes) survives a restart.
   function reconstruct(r) {
+    if (r.raw_json) {
+      try {
+        const event = normalize(JSON.parse(r.raw_json));
+        if (event?.type === 'message' && event.message) {
+          return {
+            ...event.message,
+            chatJid: r.chat_jid,
+            chatType: r.chat_jid.endsWith('@g.us') ? 'group' : 'dm',
+            msgId: r.msg_id,
+            sender: {
+              ...event.message.sender,
+              jid: r.sender_jid,
+              altJid: r.sender_alt_jid,
+              pushName: r.user,
+            },
+            isFromMe: !!r.is_from_me,
+            tsMs: r.ts,
+            receivedAtMs: r.received_at,
+            text: r.text,
+            _isReplay: true,
+          };
+        }
+      } catch {
+        // Rows predating raw webhook storage keep the minimal compatibility path.
+      }
+    }
     return {
       chatJid: r.chat_jid, chatType: r.chat_jid.endsWith('@g.us') ? 'group' : 'dm', msgId: r.msg_id,
       sender: { jid: r.sender_jid, altJid: r.sender_alt_jid, pushName: r.user, pn: null, lid: null },
@@ -585,6 +650,7 @@ function createDaemon({
       error.code = 'SHUTTING_DOWN';
       throw error;
     }
+    logEvent('water-start', { admitted: true });
     const assertStartOpen = () => {
       if (!shutdownBarrier.isFenced()) return;
       const error = new Error('water: shutdown began during startup');
@@ -620,6 +686,7 @@ function createDaemon({
       });
       const addr = await receiver.listen();
       assertStartOpen();
+      logEvent('water-receiver-ready', { ready: true });
       logger.log?.(`[water] account=${account} webhook on ${addr.address}:${addr.port}/hook/${pathToken}`);
       // Eager webhook assert/repair at boot (not just the 60s poll): a reverted/lost
       // wuzapi webhook subscription would otherwise silently drop all inbound until the
@@ -666,6 +733,7 @@ function createDaemon({
         // turn-timeout while a question is open, so this frees a stuck DM turn + its lock).
         questionTimer = startWorkTimer('question-sweep', 30_000, () => questions.sweep());
       }
+      logEvent('water-admission-open', { ready: true });
       startupToken.complete('durable-terminal');
       return { port: addr.port };
     } catch (error) {
@@ -686,7 +754,15 @@ function createDaemon({
       // Clearing callbacks and fencing are synchronous, so nothing can slip
       // between the timer stop and the admitted-token snapshot.
       const snapshot = shutdownBarrier.fence();
+      logEvent('water-shutdown-fenced', { admitted: snapshot.length });
       const drain = await shutdownBarrier.wait(snapshot, { timeoutMs: shutdownTimeoutMs });
+      logEvent('water-shutdown-drain', {
+        clean: drain.clean,
+        timed_out: drain.timedOut,
+        admitted: drain.admitted,
+        completed: drain.completed,
+        rejected: drain.rejected,
+      });
       let clean = drain.clean;
 
       try { if (receiver) await receiver.close(); } catch { clean = false; }
@@ -707,6 +783,7 @@ function createDaemon({
           clearCleanShutdown.run();
         } catch { /* DB ambiguity stays crash-like */ }
       }
+      const stopEventId = logEvent('water-stop', { clean });
       try {
         db.close();
       } catch {
@@ -717,6 +794,12 @@ function createDaemon({
           status.markInFlightForShutdown();
           clearCleanShutdown.run();
         } catch { /* a persisted clean marker remains an unavoidable DB failure */ }
+        if (stopEventId != null) {
+          try {
+            db.prepare('UPDATE events SET detail_json=? WHERE id=?')
+              .run(JSON.stringify({ clean: false }), stopEventId);
+          } catch { /* lifecycle evidence shares the same DB ambiguity */ }
+        }
         try { db.close(); } catch { /* process exit is the final containment boundary */ }
       }
       return { ...drain, clean };

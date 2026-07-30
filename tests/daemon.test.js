@@ -9,6 +9,7 @@ const path = require('node:path');
 const { createDaemon, buildExpectedWebhook } = require('../water');
 const { openDb } = require('../lib/db');
 const { sign } = require('../lib/transport/hmac');
+const { normalize } = require('../lib/transport/normalize');
 
 const GROUP = '120363419377779909@g.us';
 const DM = '66820000000@s.whatsapp.net';
@@ -433,6 +434,11 @@ test('a database close failure invalidates the clean marker before retrying clos
     reopened.prepare("SELECT v FROM daemon_state WHERE k='clean_shutdown_at'").get(),
     undefined,
   );
+  assert.deepEqual(
+    JSON.parse(reopened.prepare("SELECT detail_json FROM events WHERE kind='water-stop' ORDER BY id DESC LIMIT 1").get().detail_json),
+    { clean: false },
+    'the final lifecycle event must not report a clean stop after close failed',
+  );
   reopened.close();
 });
 
@@ -675,6 +681,207 @@ test('boot replay re-dispatches a received row that never got gated', async () =
   await new Promise((r) => setTimeout(r, 30));
   assert.equal(dispatched, 1, 'the ungated received row was re-dispatched on boot');
   await d.stop();
+});
+
+test('boot replay preserves a structured native mention from the stored webhook', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-replay-mention-'));
+  const raw = {
+    type: 'Message',
+    event: {
+      Info: {
+        Chat: GROUP,
+        Sender: '55@lid',
+        IsGroup: true,
+        ID: 'R-MENTION',
+        Timestamp: '2026-07-30T00:00:00Z',
+        PushName: 'Alice',
+      },
+      Message: {
+        extendedTextMessage: {
+          text: 'please help',
+          contextInfo: { mentionedJID: [BOT_PN] },
+        },
+      },
+    },
+  };
+  const seed = openDb(path.join(dir, 'umi.db'));
+  seed.prepare(`
+    INSERT INTO messages
+      (chat_jid,msg_id,sender_jid,user,text,raw_json,direction,account,ts,received_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)
+  `).run(
+    GROUP,
+    'R-MENTION',
+    '55@lid',
+    'Alice',
+    'please help',
+    JSON.stringify(raw),
+    'in',
+    'umi',
+    Date.now(),
+    Date.now(),
+  );
+  seed.close();
+
+  const d = daemon(dir, []);
+  let dispatched = 0;
+  d.pm.getOrSpawn = async () => {};
+  d.pm.procs = new Map([[GROUP, { claudeSessionId: 's' }]]);
+  d.pm.send = async () => {
+    dispatched++;
+    return { alreadyDelivered: true };
+  };
+  await d.start({ withTimers: false });
+  assert.equal(dispatched, 1, 'the native mention must still address the bot after replay');
+  await d.stop();
+});
+
+test('an edit fenced during shutdown replays its updated structured mention', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-replay-edit-'));
+  const originalRaw = {
+    type: 'Message',
+    event: {
+      Info: {
+        Chat: GROUP,
+        Sender: '55@lid',
+        IsGroup: true,
+        ID: 'R-EDITED',
+        Timestamp: '2026-07-30T00:00:00Z',
+        PushName: 'Alice',
+      },
+      Message: { extendedTextMessage: { text: 'please help' } },
+    },
+  };
+  const editRaw = {
+    type: 'Message',
+    event: {
+      Info: {
+        Chat: GROUP,
+        Sender: '55@lid',
+        IsGroup: true,
+        ID: 'R-EDIT-EVENT',
+        Timestamp: '2026-07-30T00:00:01Z',
+        PushName: 'Alice',
+      },
+      Message: {
+        protocolMessage: {
+          type: 14,
+          key: { ID: 'R-EDITED' },
+          editedMessage: {
+            extendedTextMessage: {
+              text: 'please help',
+              contextInfo: { mentionedJID: [BOT_PN] },
+            },
+          },
+        },
+      },
+    },
+  };
+
+  const first = daemon(dir, []);
+  await first.onMessage(normalize(originalRaw).message);
+  await waitFor(
+    () => first.db.prepare("SELECT handler_status FROM messages WHERE msg_id='R-EDITED'").get()?.handler_status === 'ignored',
+    'original unaddressed message was not gated',
+  );
+
+  let finishTurn;
+  first.pm.getOrSpawn = async () => {};
+  first.pm.procs = new Map([[GROUP, { claudeSessionId: 's' }]]);
+  first.pm.send = () => new Promise((resolve) => { finishTurn = resolve; });
+  first.pm.shutdown = async () => {};
+  await first.onMessage(msg({ msgId: 'R-DRAIN', text: 'umi finish this turn' }));
+  await waitFor(() => first.busySummary().in_flight === 1, 'drain fixture turn was never admitted');
+
+  const stopping = first.stop();
+  await waitFor(() => first._internal.shutdownBarrier.isFenced(), 'shutdown never fenced admission');
+  await first.onMessage(normalize(editRaw).message);
+  finishTurn({ alreadyDelivered: true, turnId: 'T', metrics: { resultSubtype: 'success' } });
+  await stopping;
+
+  const second = daemon(dir, []);
+  let dispatched = 0;
+  second.pm.getOrSpawn = async () => {};
+  second.pm.procs = new Map([[GROUP, { claudeSessionId: 's' }]]);
+  second.pm.send = async () => {
+    dispatched++;
+    return { alreadyDelivered: true };
+  };
+  await second.start({ withTimers: false });
+  assert.equal(dispatched, 1, 'boot replay must gate the edited native mention');
+  await second.stop();
+});
+
+test('failed boot replay stays replay-pending and prevents readiness', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-replay-failed-'));
+  const seed = openDb(path.join(dir, 'umi.db'));
+  seed.prepare(`
+    INSERT INTO messages
+      (chat_jid,msg_id,sender_jid,user,text,direction,account,handler_status,ts,received_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)
+  `).run(
+    GROUP,
+    'R-FAILED',
+    '55@lid',
+    'Alice',
+    'umi retry this',
+    'in',
+    'umi',
+    'replay-pending',
+    Date.now(),
+    Date.now(),
+  );
+  seed.close();
+
+  const d = daemon(dir, []);
+  d.pm.getOrSpawn = async () => {};
+  d.pm.procs = new Map([[GROUP, { claudeSessionId: 's' }]]);
+  d.pm.send = async () => {
+    throw new Error('replay fixture failure');
+  };
+
+  await assert.rejects(
+    d.start({ withTimers: false }),
+    /boot replay incomplete/,
+  );
+  assert.equal(
+    d.db.prepare("SELECT handler_status FROM messages WHERE msg_id='R-FAILED'").get().handler_status,
+    'replay-pending',
+  );
+  await d.stop();
+});
+
+test('lifecycle telemetry proves startup, replay, admission, drain, and stop without identifiers', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-lifecycle-'));
+  const d = daemon(dir, []);
+  await d.start({ withTimers: false });
+  await d.stop();
+
+  const reopened = openDb(path.join(dir, 'umi.db'));
+  const rows = reopened.prepare(`
+    SELECT kind, detail_json
+      FROM events
+     WHERE kind LIKE 'water-%'
+     ORDER BY id
+  `).all();
+  reopened.close();
+
+  assert.deepEqual(
+    rows.map((row) => row.kind),
+    [
+      'water-start',
+      'water-receiver-ready',
+      'water-boot-replay-complete',
+      'water-admission-open',
+      'water-shutdown-fenced',
+      'water-shutdown-drain',
+      'water-stop',
+    ],
+  );
+  const serialized = rows.map((row) => row.detail_json).join('\n');
+  for (const forbidden of ['chat', 'jid', 'message', 'session', 'socket']) {
+    assert.doesNotMatch(serialized.toLowerCase(), new RegExp(forbidden));
+  }
 });
 
 test('start(): a real HMAC-signed webhook POST records + dispatches end to end', async () => {
