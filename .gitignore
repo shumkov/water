@@ -6,5 +6,6 @@ inbox/
 config.json
 heartbeat.json
 coverage/
+.ipc/
 *.log
 .DS_Store

@@ -11,6 +11,7 @@ const { openDb } = require('../lib/db');
 const { sign } = require('../lib/transport/hmac');
 
 const GROUP = '120363419377779909@g.us';
+const DM = '66820000000@s.whatsapp.net';
 const BOT_PN = '66821683034@s.whatsapp.net';
 
 function baseConfig(dataDir) {
@@ -60,6 +61,33 @@ function daemon(dataDir, sent) {
     logger: { log() {}, warn() {}, error() {} },
   });
   return d;
+}
+
+function daemonWithDm(dataDir, sent) {
+  const config = baseConfig(dataDir);
+  config.chats[DM] = {
+    name: 'DM',
+    account: 'umi',
+    agent: 'x',
+    cwd: dataDir,
+    requireMention: false,
+  };
+  return createDaemon({
+    config,
+    account: 'umi',
+    dataDir,
+    transport: mkTransport(sent),
+    botIdentity: new Set([BOT_PN]),
+    logger: { log() {}, warn() {}, error() {} },
+  });
+}
+
+async function waitFor(predicate, message, timeoutMs = 500) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(message);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 // A stranger DM: not in `chats`, so resolveChat -> null (unconfigured).
@@ -319,6 +347,301 @@ test('injectTurn is fail-closed on an unknown chat, dispatches into a configured
   await d.injectTurn({ chat_id: GROUP, text: 'daily summary please' });
   assert.equal(dispatched, 1);
   await d.stop();
+});
+
+test('shutdown fences newly persisted webhooks and writes clean marker only after the admitted turn is durable', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-shutdown-clean-'));
+  const d = daemon(dir, []);
+  let finishTurn;
+  d.pm.getOrSpawn = async () => {};
+  d.pm.procs = new Map([[GROUP, { claudeSessionId: 's' }]]);
+  d.pm.send = () => new Promise((resolve) => { finishTurn = resolve; });
+  d.pm.shutdown = async () => {};
+
+  await d.onMessage(msg({ msgId: 'BEFORE', text: 'umi work on this' }));
+  await waitFor(() => d.busySummary().in_flight === 1, 'first turn was never admitted');
+
+  const stopping = d.stop();
+  await waitFor(() => d._internal.shutdownBarrier.isFenced(), 'shutdown never fenced admission');
+  await d.onMessage(msg({ msgId: 'AFTER', text: 'umi this must replay' }));
+
+  finishTurn({ alreadyDelivered: true, turnId: 'T', metrics: { resultSubtype: 'success' } });
+  const result = await stopping;
+  assert.equal(result.clean, true);
+
+  const reopened = openDb(path.join(dir, 'umi.db'));
+  assert.equal(
+    reopened.prepare("SELECT handler_status FROM messages WHERE msg_id='BEFORE'").get().handler_status,
+    'replied',
+  );
+  assert.equal(
+    reopened.prepare("SELECT handler_status FROM messages WHERE msg_id='AFTER'").get().handler_status,
+    null,
+    'post-fence webhook stays received for boot replay',
+  );
+  assert.ok(reopened.prepare("SELECT v FROM daemon_state WHERE k='clean_shutdown_at'").get());
+  reopened.close();
+});
+
+test('a turn rejected during shutdown stays replay-eligible and forbids the clean marker', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-shutdown-reject-'));
+  const d = daemon(dir, []);
+  let rejectTurn;
+  d.pm.getOrSpawn = async () => {};
+  d.pm.procs = new Map([[GROUP, { claudeSessionId: 's' }]]);
+  d.pm.send = () => new Promise((resolve, reject) => { rejectTurn = reject; });
+  d.pm.shutdown = async () => {};
+
+  await d.onMessage(msg({ msgId: 'REJECTED', text: 'umi work on this' }));
+  await waitFor(() => d.busySummary().in_flight === 1, 'turn was never admitted');
+  const stopping = d.stop();
+  await waitFor(() => d._internal.shutdownBarrier.isFenced(), 'shutdown never fenced admission');
+  rejectTurn(new Error('session stopped'));
+
+  const result = await stopping;
+  assert.equal(result.clean, false);
+  const reopened = openDb(path.join(dir, 'umi.db'));
+  assert.equal(
+    reopened.prepare("SELECT handler_status FROM messages WHERE msg_id='REJECTED'").get().handler_status,
+    'replay-pending',
+  );
+  assert.equal(
+    reopened.prepare("SELECT v FROM daemon_state WHERE k='clean_shutdown_at'").get(),
+    undefined,
+  );
+  reopened.close();
+});
+
+test('a database close failure invalidates the clean marker before retrying close', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-shutdown-close-'));
+  const d = daemon(dir, []);
+  d.pm.shutdown = async () => {};
+  const originalClose = d.db.close.bind(d.db);
+  let closeCalls = 0;
+  d.db.close = () => {
+    closeCalls++;
+    if (closeCalls === 1) throw new Error('simulated close failure');
+    return originalClose();
+  };
+
+  const result = await d.stop();
+  assert.equal(result.clean, false);
+  assert.equal(closeCalls, 2, 'a failed close should be retried after invalidating the marker');
+
+  const reopened = openDb(path.join(dir, 'umi.db'));
+  assert.equal(
+    reopened.prepare("SELECT v FROM daemon_state WHERE k='clean_shutdown_at'").get(),
+    undefined,
+  );
+  reopened.close();
+});
+
+test('IPC work-producing methods reject after the shutdown fence while ping and busy remain available', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-shutdown-ipc-'));
+  const d = daemon(dir, []);
+  d._internal.shutdownBarrier.fence();
+
+  assert.deepEqual(
+    await d.injectTurn({ chat_id: GROUP, text: 'daily summary' }),
+    { ok: false, reason: 'shutting-down' },
+  );
+  assert.deepEqual(
+    await d._internal.sendTextFromIpc({ chat_id: GROUP, text: 'operator message' }),
+    { ok: false, reason: 'shutting-down' },
+  );
+  assert.deepEqual(d.busySummary(), { account: 'umi', in_flight: 0 });
+  assert.equal(d._internal.shutdownBarrier.isFenced(), true);
+  await d.stop();
+});
+
+test('busy summary counts non-turn admitted work as well as message turns', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-busy-daemon-wide-'));
+  const d = daemon(dir, []);
+  const timerToken = d._internal.shutdownBarrier.admit({
+    kind: 'timer:sla',
+    owner: 'timer:sla',
+  });
+  assert.deepEqual(d.busySummary(), { account: 'umi', in_flight: 1 });
+  timerToken.complete('timer-complete');
+  assert.deepEqual(d.busySummary(), { account: 'umi', in_flight: 0 });
+  await d.stop();
+});
+
+test('shutdown waits for an already-running watchdog callback', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-shutdown-watchdog-'));
+  const d = daemon(dir, []);
+  let finishPoll;
+  const running = d._internal.runAdmitted(
+    { kind: 'timer:poll', owner: 'timer:poll' },
+    () => new Promise((resolve) => { finishPoll = resolve; }),
+  );
+  await waitFor(() => d.busySummary().in_flight === 1, 'watchdog callback was never admitted');
+  let stopped = false;
+  const stopping = d.stop().then((result) => { stopped = true; return result; });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(stopped, false, 'shutdown must wait for the admitted callback');
+  finishPoll();
+  await running;
+  assert.equal((await stopping).clean, true);
+});
+
+test('shutdown waits for a connection-event revive already in progress', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-shutdown-connection-'));
+  const d = daemon(dir, []);
+  let finishRevive;
+  d._internal.transport.connectSession = () => new Promise((resolve) => {
+    finishRevive = resolve;
+  });
+
+  const running = d.onConnectionEvent({ kind: 'connect-failure' });
+  await waitFor(
+    () => d.busySummary().in_flight === 1,
+    'connection event was never admitted',
+  );
+  let stopped = false;
+  const stopping = d.stop().then((result) => {
+    stopped = true;
+    return result;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(stopped, false, 'shutdown must wait for the admitted connection event');
+
+  finishRevive();
+  await running;
+  assert.equal((await stopping).clean, true);
+});
+
+test('shutdown during startup prevents later listeners and records a crash-like stop', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-shutdown-startup-'));
+  let finishIdentity;
+  const transport = mkTransport([]);
+  transport.sessionStatus = () => new Promise((resolve) => { finishIdentity = resolve; });
+  const d = createDaemon({
+    config: baseConfig(dir),
+    account: 'umi',
+    dataDir: dir,
+    transport,
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  d.pm.shutdown = async () => {};
+
+  const starting = d.start({ withTimers: false });
+  await waitFor(() => d.busySummary().in_flight === 1, 'startup was never admitted');
+  const stopping = d.stop();
+  finishIdentity({ jid: BOT_PN });
+  await assert.rejects(starting, /shutdown began during startup/);
+  assert.equal((await stopping).clean, false);
+
+  const reopened = openDb(path.join(dir, 'umi.db'));
+  assert.equal(
+    reopened.prepare("SELECT v FROM daemon_state WHERE k='clean_shutdown_at'").get(),
+    undefined,
+  );
+  reopened.close();
+});
+
+test('a question answer remains admissible after the fence because it completes an existing turn', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-shutdown-question-'));
+  const d = daemonWithDm(dir, []);
+  d.pm.answerQuestion = () => true;
+  d.db.prepare(`
+    INSERT INTO pending_questions
+      (chat_jid, tool_call_id, session_id, asker_jid, questions_json, status, created_ts)
+    VALUES (?, ?, ?, ?, ?, 'open', ?)
+  `).run(DM, 'tool-1', DM, DM, JSON.stringify([{
+    header: 'size',
+    question: 'Which size?',
+    options: [{ label: 'Small', description: 'small' }],
+  }]), Date.now());
+
+  const turnToken = d._internal.shutdownBarrier.admit({ kind: 'turn', owner: DM });
+  const stopping = d.stop();
+  await waitFor(() => d._internal.shutdownBarrier.isFenced(), 'shutdown never fenced');
+  await d.onMessage(msg({
+    chatJid: DM,
+    chatType: 'dm',
+    msgId: 'ANSWER',
+    sender: { jid: DM, altJid: null, pn: DM, lid: null, pushName: 'Alice' },
+    text: '1',
+  }));
+  assert.equal(
+    d.db.prepare("SELECT status FROM pending_questions WHERE tool_call_id='tool-1'").get().status,
+    'answered',
+  );
+  assert.equal(
+    d.db.prepare("SELECT handler_status FROM messages WHERE msg_id='ANSWER'").get().handler_status,
+    'ignored',
+  );
+  turnToken.complete('durable-terminal');
+  assert.equal((await stopping).clean, true);
+});
+
+test('an edit arriving after the fence resets its original row for boot re-evaluation', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-shutdown-edit-'));
+  const d = daemon(dir, []);
+  await d.onMessage(msg({ msgId: 'EDIT-TARGET', text: 'not addressed' }));
+  await waitFor(
+    () => d.db.prepare("SELECT handler_status FROM messages WHERE msg_id='EDIT-TARGET'").get()?.handler_status === 'ignored',
+    'original message was never gated',
+  );
+  d._internal.shutdownBarrier.fence();
+  await d.onMessage(msg({
+    msgId: 'EDIT-EVENT',
+    edit: { targetMsgId: 'EDIT-TARGET' },
+    text: 'now addressed to umi',
+  }));
+  assert.equal(
+    d.db.prepare("SELECT handler_status FROM messages WHERE msg_id='EDIT-TARGET'").get().handler_status,
+    null,
+  );
+  await d.stop();
+});
+
+test('an ambiguous delivery during shutdown forbids the clean marker and replays the inbound', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-shutdown-ambiguous-'));
+  const d = daemon(dir, []);
+  let rejectSend;
+  d._internal.transport.sendText = () => new Promise((resolve, reject) => { rejectSend = reject; });
+  d.pm.getOrSpawn = async () => {};
+  d.pm.procs = new Map([[GROUP, { claudeSessionId: 's' }]]);
+  d.pm.send = async () => {
+    const delivered = await d._internal.toolDispatcher({
+      sessionKey: GROUP,
+      chatId: GROUP,
+      toolName: 'reply',
+      text: 'possibly landed',
+    });
+    assert.equal(delivered.ok, false);
+    return { alreadyDelivered: true, turnId: 'T', metrics: { resultSubtype: 'success' } };
+  };
+  d.pm.shutdown = async () => {};
+
+  await d.onMessage(msg({ msgId: 'AMBIGUOUS', text: 'umi answer' }));
+  await waitFor(
+    () => d.db.prepare("SELECT 1 FROM messages WHERE direction='out' AND status='pending'").get(),
+    'outbound was never reserved',
+  );
+  const stopping = d.stop();
+  const error = new Error('send timed out');
+  error.code = 'TIMEOUT';
+  rejectSend(error);
+  const result = await stopping;
+  assert.equal(result.clean, false);
+
+  const reopened = openDb(path.join(dir, 'umi.db'));
+  assert.equal(
+    reopened.prepare("SELECT handler_status FROM messages WHERE msg_id='AMBIGUOUS'").get().handler_status,
+    'replay-pending',
+  );
+  assert.equal(
+    reopened.prepare("SELECT error FROM messages WHERE direction='out'").get().error,
+    'ambiguous-send',
+  );
+  assert.equal(
+    reopened.prepare("SELECT v FROM daemon_state WHERE k='clean_shutdown_at'").get(),
+    undefined,
+  );
+  reopened.close();
 });
 
 test('abort routing interrupts the process and marks the row aborted', async () => {
