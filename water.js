@@ -198,7 +198,7 @@ function createDaemon({
   });
   const containmentProbePm = new ProcessManager({
     processFactory: containmentProbeFactory,
-    budget: 1,
+    budget: 3,
     logger,
   });
   const containmentProbeSessionKey = 'water-containment-probe';
