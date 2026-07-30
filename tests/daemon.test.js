@@ -55,11 +55,12 @@ function msg(over = {}) {
   };
 }
 
-function daemon(dataDir, sent) {
+function daemon(dataDir, sent, options = {}) {
   const d = createDaemon({
     config: baseConfig(dataDir), account: 'umi', dataDir,
     transport: mkTransport(sent), botIdentity: new Set([BOT_PN]),
     logger: { log() {}, warn() {}, error() {} },
+    ...options,
   });
   return d;
 }
@@ -350,6 +351,195 @@ test('injectTurn is fail-closed on an unknown chat, dispatches into a configured
   await d.stop();
 });
 
+test('deployment containment probe exercises and retires one real Water session path', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-containment-probe-'));
+  const previous = {
+    launcher: process.env.ORCHESTRA_SESSION_LAUNCHER,
+    socket: process.env.ORCHESTRA_TMUX_SOCKET,
+    requireServer: process.env.ORCHESTRA_TMUX_REQUIRE_SERVER,
+  };
+  process.env.ORCHESTRA_SESSION_LAUNCHER = '/usr/local/libexec/claude-session-scope';
+  process.env.ORCHESTRA_TMUX_SOCKET = 'water';
+  process.env.ORCHESTRA_TMUX_REQUIRE_SERVER = '1';
+  t.after(() => {
+    for (const [name, value] of [
+      ['ORCHESTRA_SESSION_LAUNCHER', previous.launcher],
+      ['ORCHESTRA_TMUX_SOCKET', previous.socket],
+      ['ORCHESTRA_TMUX_REQUIRE_SERVER', previous.requireServer],
+    ]) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+
+  const tmuxRunner = {
+    async listPolygramSessions() { return []; },
+    async killSession() {},
+  };
+  const d = daemon(dir, [], { containmentProbeTmuxRunner: tmuxRunner });
+  let killed = null;
+  d._internal.containmentProbePm.getOrSpawn = async (sessionKey, context) => {
+    assert.equal(sessionKey, 'water-containment-probe');
+    assert.equal(context.runtime, 'claude');
+    return {
+      closed: false,
+      tmuxSession: 'water-probe-umi-channels-deadbeef',
+    };
+  };
+  d._internal.containmentProbePm.kill = async (sessionKey, reason) => {
+    killed = { sessionKey, reason };
+    return true;
+  };
+
+  const started = await d._internal.startContainmentProbe();
+  assert.deepEqual(started, {
+    ok: true,
+    session_name: 'water-probe-umi-channels-deadbeef',
+  });
+  assert.equal(d.busySummary().in_flight, 1);
+  assert.deepEqual(await d._internal.stopContainmentProbe(), { ok: true });
+  assert.deepEqual(killed, {
+    sessionKey: 'water-containment-probe',
+    reason: 'containment-probe-complete',
+  });
+  assert.equal(d.busySummary().in_flight, 0);
+  await d.stop();
+});
+
+test('replacement daemon retires a pre-spawn-intent probe after external session creation', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-containment-recovery-'));
+  const previous = {
+    launcher: process.env.ORCHESTRA_SESSION_LAUNCHER,
+    socket: process.env.ORCHESTRA_TMUX_SOCKET,
+    requireServer: process.env.ORCHESTRA_TMUX_REQUIRE_SERVER,
+  };
+  process.env.ORCHESTRA_SESSION_LAUNCHER = '/usr/local/libexec/claude-session-scope';
+  process.env.ORCHESTRA_TMUX_SOCKET = 'water';
+  process.env.ORCHESTRA_TMUX_REQUIRE_SERVER = '1';
+  t.after(() => {
+    for (const [name, value] of [
+      ['ORCHESTRA_SESSION_LAUNCHER', previous.launcher],
+      ['ORCHESTRA_TMUX_SOCKET', previous.socket],
+      ['ORCHESTRA_TMUX_REQUIRE_SERVER', previous.requireServer],
+    ]) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+
+  const sessions = new Set();
+  const killed = [];
+  const tmuxRunner = {
+    async listPolygramSessions() { return [...sessions]; },
+    async killSession(name) {
+      killed.push(name);
+      sessions.delete(name);
+    },
+  };
+  fs.writeFileSync(
+    path.join(dir, '.containment-probe-umi.json'),
+    `${JSON.stringify({ version: 2, state: 'armed', socket_name: 'water' })}\n`,
+    { mode: 0o600 },
+  );
+  sessions.add('water-probe-umi-channels-cafebabe');
+  const replacement = daemon(dir, [], {
+    tmuxRunner: {
+      async listPolygramSessions() { return []; },
+      async killSession() {},
+    },
+    containmentProbeTmuxRunner: tmuxRunner,
+  });
+  await replacement.start({ withTimers: false });
+  assert.deepEqual(killed, ['water-probe-umi-channels-cafebabe']);
+  assert.deepEqual([...sessions], []);
+
+  await replacement.stop();
+});
+
+test('containment recovery rejects a symlink marker before touching tmux', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-containment-marker-'));
+  fs.writeFileSync(path.join(dir, 'target'), 'do-not-follow\n');
+  fs.symlinkSync('target', path.join(dir, '.containment-probe-umi.json'));
+  let listed = false;
+  const d = daemon(dir, [], {
+    containmentProbeTmuxRunner: {
+      async listPolygramSessions() {
+        listed = true;
+        return [];
+      },
+      async killSession() {},
+    },
+  });
+  await assert.rejects(
+    d.start({ withTimers: false }),
+    /containment-probe-marker-unsafe/,
+  );
+  assert.equal(listed, false);
+  await d.stop();
+});
+
+test('failed partial probe spawn keeps intent until replacement proves cleanup', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-containment-partial-'));
+  const previous = {
+    launcher: process.env.ORCHESTRA_SESSION_LAUNCHER,
+    socket: process.env.ORCHESTRA_TMUX_SOCKET,
+    requireServer: process.env.ORCHESTRA_TMUX_REQUIRE_SERVER,
+  };
+  process.env.ORCHESTRA_SESSION_LAUNCHER = '/usr/local/libexec/claude-session-scope';
+  process.env.ORCHESTRA_TMUX_SOCKET = 'water';
+  process.env.ORCHESTRA_TMUX_REQUIRE_SERVER = '1';
+  t.after(() => {
+    for (const [name, value] of [
+      ['ORCHESTRA_SESSION_LAUNCHER', previous.launcher],
+      ['ORCHESTRA_TMUX_SOCKET', previous.socket],
+      ['ORCHESTRA_TMUX_REQUIRE_SERVER', previous.requireServer],
+    ]) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+
+  const name = 'water-probe-umi-channels-acde1234';
+  const sessions = new Set();
+  let cleanupFails = true;
+  const runner = {
+    async listPolygramSessions() { return [...sessions]; },
+    async killSession(sessionName) {
+      if (cleanupFails) throw new Error('tmux cleanup failed');
+      sessions.delete(sessionName);
+    },
+  };
+  const failed = daemon(dir, [], { containmentProbeTmuxRunner: runner });
+  failed._internal.containmentProbePm.getOrSpawn = async () => {
+    sessions.add(name);
+    throw new Error('spawn failed after tmux creation');
+  };
+  failed._internal.containmentProbePm.kill = async () => {
+    throw new Error('manager lost partial process');
+  };
+  await assert.rejects(
+    failed._internal.startContainmentProbe(),
+    /spawn failed after tmux creation/,
+  );
+  assert.equal(
+    fs.existsSync(path.join(dir, '.containment-probe-umi.json')),
+    true,
+  );
+
+  cleanupFails = false;
+  const replacement = daemon(dir, [], {
+    containmentProbeTmuxRunner: runner,
+  });
+  await replacement.start({ withTimers: false });
+  assert.deepEqual([...sessions], []);
+  assert.equal(
+    fs.existsSync(path.join(dir, '.containment-probe-umi.json')),
+    false,
+  );
+  await replacement.stop();
+  await failed.stop();
+});
+
 test('shutdown fences newly persisted webhooks and writes clean marker only after the admitted turn is durable', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-shutdown-clean-'));
   const d = daemon(dir, []);
@@ -533,6 +723,7 @@ test('shutdown during startup prevents later listeners and records a crash-like 
 
   const starting = d.start({ withTimers: false });
   await waitFor(() => d.busySummary().in_flight === 1, 'startup was never admitted');
+  await waitFor(() => typeof finishIdentity === 'function', 'startup never reached identity discovery');
   const stopping = d.stop();
   finishIdentity({ jid: BOT_PN });
   await assert.rejects(starting, /shutdown began during startup/);
@@ -945,7 +1136,8 @@ test('explicit replay-pending rows are retried even after the legacy replay wind
 
 test('lifecycle telemetry proves startup, replay, admission, drain, and stop without identifiers', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-lifecycle-'));
-  const d = daemon(dir, []);
+  const invocationId = 'a'.repeat(32);
+  const d = daemon(dir, [], { invocationId });
   await d.start({ withTimers: false });
   await d.stop();
 
@@ -971,6 +1163,9 @@ test('lifecycle telemetry proves startup, replay, admission, drain, and stop wit
     ],
   );
   const serialized = rows.map((row) => row.detail_json).join('\n');
+  for (const row of rows) {
+    assert.equal(JSON.parse(row.detail_json).invocation_id, invocationId);
+  }
   for (const forbidden of ['chat', 'jid', 'message', 'session', 'socket']) {
     assert.doesNotMatch(serialized.toLowerCase(), new RegExp(forbidden));
   }

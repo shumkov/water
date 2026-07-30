@@ -5,12 +5,22 @@
 const { call, socketPathFor, readSecret } = require('../lib/ipc/client');
 
 function usage() {
-  console.error('Usage: water-ipc <account> ping|busy|injectTurn|sendText [json-payload]');
+  console.error('Usage: water-ipc <account> ping|busy|injectTurn|sendText|containmentProbeStart|containmentProbeStop [json-payload]');
 }
 
 async function main(argv = process.argv.slice(2)) {
   const [account, op, payloadText] = argv;
-  if (!account || !['ping', 'busy', 'injectTurn', 'sendText'].includes(op)) {
+  if (
+    !account
+    || ![
+      'ping',
+      'busy',
+      'injectTurn',
+      'sendText',
+      'containmentProbeStart',
+      'containmentProbeStop',
+    ].includes(op)
+  ) {
     usage();
     return 2;
   }

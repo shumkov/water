@@ -7,6 +7,7 @@
 
 'use strict';
 
+const fs = require('node:fs');
 const path = require('node:path');
 const { AsyncLocalStorage } = require('node:async_hooks');
 const { loadConfig, scopeToAccount, resolveChat } = require('./lib/config');
@@ -70,7 +71,10 @@ function createDaemon({
   logger = console,
   transport: injectedTransport,
   botIdentity: injectedBotIdentity,
+  tmuxRunner: injectedTmuxRunner,
+  containmentProbeTmuxRunner: injectedContainmentProbeTmuxRunner,
   shutdownTimeoutMs = 300_000,
+  invocationId = process.env.INVOCATION_ID,
 } = {}) {
   const scoped = scopeToAccount(config, account);
   const acc = scoped.accountConfig;
@@ -86,6 +90,15 @@ function createDaemon({
   const resolve = (jid) => resolveChat(scoped, jid);
   const shutdownBarrier = createShutdownBarrier();
   const admissionContext = new AsyncLocalStorage();
+  if (
+    invocationId != null
+    && !/^[0-9a-f]{32}$/.test(invocationId)
+  ) {
+    throw new Error('water: invalid systemd invocation identity');
+  }
+  const lifecycleDetail = (detail) => (
+    invocationId == null ? detail : { ...detail, invocation_id: invocationId }
+  );
 
   // Boot sweeps: any pending outbound is a prior-life crash orphan.
   outbound.sweepCrashed();
@@ -120,11 +133,17 @@ function createDaemon({
   logger.log?.(`[water] session containment configured: launcher=${sessionLauncher ? 'yes' : 'no'} socket=${tmuxSocketName ? 'yes' : 'no'} require-server=${requireExistingServer ? 'yes' : 'no'}`);
   const vendored = ensureVendoredClaudeBin(CLAUDE_CLI_PINNED_VERSION);
   if (!vendored.ok) throw new Error(`water: claude binary unavailable: ${vendored.reason}`);
-  const tmuxRunner = createTmuxRunner({
+  const tmuxRunner = injectedTmuxRunner || createTmuxRunner({
     logger,
     sessionPrefix: 'water',
     socketName: tmuxSocketName,
     requireExistingServer,
+  });
+  const containmentProbeTmuxRunner = injectedContainmentProbeTmuxRunner || createTmuxRunner({
+    logger,
+    sessionPrefix: 'water-probe',
+    socketName: 'water',
+    requireExistingServer: true,
   });
   const factory = createProcessFactory({
     config: { chats: scoped.chats, bot: { pm: 'cli' } },
@@ -135,6 +154,25 @@ function createDaemon({
     // orchestra identity — water's names so the shared engine speaks WhatsApp.
     sessionPrefix: 'water',
     bridgeServerName: 'water-bridge',
+    appDataDir: path.join(require('node:os').homedir(), '.water'),
+    attachmentBase: '/tmp/water-attachments',
+    productName: 'water',
+    surfaceName: 'WhatsApp',
+    pmDefault: 'cli',
+  });
+  const containmentProbeFactory = createProcessFactory({
+    config: { chats: scoped.chats, bot: { pm: 'cli' } },
+    tmuxRunner: containmentProbeTmuxRunner,
+    botName: account,
+    toolDispatcher,
+    channelsClaudeBin: vendored.path,
+    db,
+    logger,
+    sessionLauncher,
+    displayHint: WATER_DISPLAY_HINT,
+    maxOutboundFileBytes: (acc.mediaMaxMb || 100) * 1024 * 1024,
+    sessionPrefix: 'water-probe',
+    bridgeServerName: 'water-probe-bridge',
     appDataDir: path.join(require('node:os').homedir(), '.water'),
     attachmentBase: '/tmp/water-attachments',
     productName: 'water',
@@ -158,11 +196,227 @@ function createDaemon({
       onQuestionAsked: (sk, p) => questions?.onAsked(sk, p),   // `ask` tool (docs/ASK_SPEC.md)
     },
   });
+  const containmentProbePm = new ProcessManager({
+    processFactory: containmentProbeFactory,
+    budget: 1,
+    logger,
+  });
+  const containmentProbeSessionKey = 'water-containment-probe';
+  const containmentProbePrefix = `water-probe-${String(account).replace(/[^\w-]/g, '_')}-channels-`;
+  const containmentProbeMarkerPath = path.join(
+    dataDir,
+    `.containment-probe-${String(account).replace(/[^\w-]/g, '_')}.json`,
+  );
+  let containmentProbe = null;
+  let containmentProbeOperation = Promise.resolve();
+
+  function withContainmentProbeLock(operation) {
+    const result = containmentProbeOperation
+      .catch(() => {})
+      .then(operation);
+    containmentProbeOperation = result.catch(() => {});
+    return result;
+  }
+
+  function validateContainmentProbeSessionName(value) {
+    const name = String(value || '');
+    const suffix = name.slice(containmentProbePrefix.length);
+    if (!name.startsWith(containmentProbePrefix) || !/^[0-9a-f]{8}$/.test(suffix)) {
+      throw new Error('containment-probe-session-invalid');
+    }
+    return name;
+  }
+
+  function readContainmentProbeMarker() {
+    try {
+      const stat = fs.lstatSync(containmentProbeMarkerPath);
+      if (
+        !stat.isFile()
+        || stat.isSymbolicLink()
+        || stat.uid !== process.getuid()
+        || (stat.mode & 0o777) !== 0o600
+        || stat.nlink !== 1
+      ) {
+        throw new Error('containment-probe-marker-unsafe');
+      }
+      const fd = fs.openSync(
+        containmentProbeMarkerPath,
+        fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
+      );
+      let marker;
+      try {
+        marker = JSON.parse(fs.readFileSync(fd, 'utf8'));
+      } finally {
+        fs.closeSync(fd);
+      }
+      if (
+        marker?.version !== 2
+        || marker?.state !== 'armed'
+        || marker?.socket_name !== 'water'
+      ) {
+        throw new Error('containment-probe-marker-invalid');
+      }
+      return true;
+    } catch (error) {
+      if (error?.code === 'ENOENT') return false;
+      throw error;
+    }
+  }
+
+  function writeContainmentProbeMarker() {
+    const fd = fs.openSync(
+      containmentProbeMarkerPath,
+      fs.constants.O_WRONLY
+        | fs.constants.O_CREAT
+        | fs.constants.O_EXCL
+        | fs.constants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      fs.writeFileSync(
+        fd,
+        `${JSON.stringify({ version: 2, state: 'armed', socket_name: 'water' })}\n`,
+      );
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    const dirFd = fs.openSync(dataDir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+    try {
+      fs.fsyncSync(dirFd);
+    } finally {
+      fs.closeSync(dirFd);
+    }
+  }
+
+  function removeContainmentProbeMarker() {
+    try {
+      fs.unlinkSync(containmentProbeMarkerPath);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
+
+  async function retireContainmentProbeSessions(expectedSessionName = null) {
+    const sessions = await containmentProbeTmuxRunner.listPolygramSessions(
+      account,
+      { strict: true },
+    );
+    for (const name of sessions) validateContainmentProbeSessionName(name);
+    if (sessions.length > 1) {
+      throw new Error('containment-probe-session-ambiguous');
+    }
+    if (
+      expectedSessionName
+      && sessions.length === 1
+      && sessions[0] !== expectedSessionName
+    ) {
+      throw new Error('containment-probe-session-mismatch');
+    }
+    if (sessions.length === 1) {
+      await containmentProbeTmuxRunner.killSession(sessions[0], { strict: true });
+    }
+    const remaining = await containmentProbeTmuxRunner.listPolygramSessions(
+      account,
+      { strict: true },
+    );
+    if (remaining.length !== 0) {
+      throw new Error('containment-probe-retirement-unproven');
+    }
+    removeContainmentProbeMarker();
+  }
+
+  function stopContainmentProbe(reason = 'containment-probe-complete') {
+    return withContainmentProbeLock(async () => {
+      const active = containmentProbe;
+      const markerArmed = readContainmentProbeMarker();
+      if (!active && !markerArmed) return { ok: true };
+      const activeSessionName = active
+        ? validateContainmentProbeSessionName(active.proc?.tmuxSession)
+        : null;
+      containmentProbe = null;
+      if (active) clearTimeout(active.timer);
+      try {
+        if (active) await containmentProbePm.kill(containmentProbeSessionKey, reason);
+        await retireContainmentProbeSessions(activeSessionName);
+        active?.token.complete('durable-terminal');
+        return { ok: true };
+      } catch (error) {
+        active?.token.fail('containment-probe-retirement-failed');
+        throw error;
+      }
+    });
+  }
+
+  function startContainmentProbe() {
+    return withContainmentProbeLock(async () => {
+      if (
+        !sessionLauncher
+        || tmuxSocketName !== 'water'
+        || !requireExistingServer
+      ) {
+        return { ok: false, reason: 'containment-not-configured' };
+      }
+      if (containmentProbe) {
+        return { ok: false, reason: 'containment-probe-active' };
+      }
+      const token = shutdownBarrier.admit({
+        kind: 'containment-probe',
+        owner: containmentProbeSessionKey,
+      });
+      if (!token) return { ok: false, reason: 'shutting-down' };
+      let intentArmed = false;
+      try {
+        writeContainmentProbeMarker();
+        intentArmed = true;
+        const proc = await containmentProbePm.getOrSpawn(containmentProbeSessionKey, {
+          runtime: 'claude',
+          label: 'containment-probe',
+          cwd: dataDir,
+        });
+        const sessionName = validateContainmentProbeSessionName(proc?.tmuxSession);
+        const timer = setTimeout(() => {
+          stopContainmentProbe('containment-probe-timeout')
+            .catch((error) => logger.error?.(
+              'containment-probe timeout cleanup',
+              error?.message,
+            ));
+        }, 60_000);
+        timer.unref?.();
+        containmentProbe = { proc, token, timer };
+        return { ok: true, session_name: sessionName };
+      } catch (error) {
+        token.fail('containment-probe-start-failed');
+        try {
+          await containmentProbePm.kill(
+            containmentProbeSessionKey,
+            'containment-probe-start-failed',
+          );
+        } catch { /* failed spawn teardown remains a rejected probe */ }
+        if (intentArmed) {
+          try {
+            await retireContainmentProbeSessions();
+          } catch {
+            // Keep the durable intent for replacement-daemon boot cleanup.
+          }
+        }
+        throw error;
+      }
+    });
+  }
 
   function logEvent(kind, detail) {
     try {
+      const storedDetail = kind.startsWith('water-')
+        ? lifecycleDetail(detail || {})
+        : (detail || {});
       const result = db.prepare('INSERT INTO events (ts, chat_jid, kind, detail_json) VALUES (?,?,?,?)')
-        .run(Date.now(), detail?.chatJid || detail?.chat_jid || null, kind, JSON.stringify(detail || {}));
+        .run(
+          Date.now(),
+          storedDetail.chatJid || storedDetail.chat_jid || null,
+          kind,
+          JSON.stringify(storedDetail),
+        );
       return Number(result.lastInsertRowid);
     } catch {
       return null;
@@ -680,6 +934,8 @@ function createDaemon({
       throw error;
     };
     try {
+      await stopContainmentProbe('daemon-start-recovery');
+      assertStartOpen();
       await admissionContext.run(startupToken, () => learnIdentity());
       assertStartOpen();
       const pathToken = acc.webhook?.pathToken || 'water';
@@ -734,6 +990,8 @@ function createDaemon({
           busy: async () => busySummary(),
           injectTurn: async (params) => injectTurn(params),
           sendText: async (params) => sendTextFromIpc(params),
+          containmentProbeStart: async () => startContainmentProbe(),
+          containmentProbeStop: async () => stopContainmentProbe(),
         },
       });
       assertStartOpen();
@@ -778,6 +1036,12 @@ function createDaemon({
       // between the timer stop and the admitted-token snapshot.
       const snapshot = shutdownBarrier.fence();
       logEvent('water-shutdown-fenced', { admitted: snapshot.length });
+      let containmentProbeClean = true;
+      try {
+        await stopContainmentProbe('daemon-shutdown');
+      } catch {
+        containmentProbeClean = false;
+      }
       const drain = await shutdownBarrier.wait(snapshot, { timeoutMs: shutdownTimeoutMs });
       logEvent('water-shutdown-drain', {
         clean: drain.clean,
@@ -786,7 +1050,7 @@ function createDaemon({
         completed: drain.completed,
         rejected: drain.rejected,
       });
-      let clean = drain.clean && !startupFailed;
+      let clean = drain.clean && containmentProbeClean && !startupFailed;
 
       try { if (receiver) await receiver.close(); } catch { clean = false; }
       try { if (ipc) await ipc.close(); } catch { clean = false; }
@@ -820,7 +1084,7 @@ function createDaemon({
         if (stopEventId != null) {
           try {
             db.prepare('UPDATE events SET detail_json=? WHERE id=?')
-              .run(JSON.stringify({ clean: false }), stopEventId);
+              .run(JSON.stringify(lifecycleDetail({ clean: false })), stopEventId);
           } catch { /* lifecycle evidence shares the same DB ambiguity */ }
         }
         try { db.close(); } catch { /* process exit is the final containment boundary */ }
@@ -857,6 +1121,9 @@ function createDaemon({
       shutdownBarrier,
       runAdmitted,
       sendTextFromIpc,
+      startContainmentProbe,
+      stopContainmentProbe,
+      containmentProbePm,
       questions,
     },
   };

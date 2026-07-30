@@ -26,24 +26,27 @@ describe('water session containment wiring', () => {
     );
   });
 
-  test('requires exactly "1" and passes the flag to every tmux runner', () => {
+  test('requires exactly "1"; the probe runner always requires its fixed server', () => {
     assert.match(
       src,
       /const requireExistingServer = process\.env\.ORCHESTRA_TMUX_REQUIRE_SERVER === '1';/,
     );
     const runnerCalls = [...src.matchAll(/createTmuxRunner\(\{([^}]*)\}\)/g)];
-    assert.equal(runnerCalls.length, 1);
+    assert.equal(runnerCalls.length, 2);
     assert.match(runnerCalls[0][1], /\brequireExistingServer\b/);
+    assert.match(runnerCalls[1][1], /\brequireExistingServer: true\b/);
   });
 
-  test('passes the configured socket independently to every tmux runner', () => {
+  test('uses the configured app socket and binds crash cleanup to the water socket', () => {
     assert.match(
       src,
       /const tmuxSocketName = process\.env\.ORCHESTRA_TMUX_SOCKET \|\| null;/,
     );
     const runnerCalls = [...src.matchAll(/createTmuxRunner\(\{([^}]*)\}\)/g)];
-    assert.equal(runnerCalls.length, 1);
+    assert.equal(runnerCalls.length, 2);
     assert.match(runnerCalls[0][1], /\bsocketName: tmuxSocketName\b/);
+    assert.match(runnerCalls[1][1], /\bsocketName: 'water'/);
+    assert.match(runnerCalls[1][1], /\bsessionPrefix: 'water-probe'/);
   });
 
   test('logs only configured states, never launcher paths or socket names', () => {
