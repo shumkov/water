@@ -48,6 +48,13 @@ test('rejects missing accounts', () => {
   assert.throws(() => validateConfig({ chats: {} }), ConfigError);
 });
 
+test('rejects HMAC disabled with a leftover key', () => {
+  const c = base();
+  c.accounts.umi.webhook.requireHmac = false;
+  c.accounts.umi.wuzapi.hmacKey = 'leftover-secret';
+  assert.throws(() => validateConfig(c), /hmacKey must be empty when.*requireHmac is false/);
+});
+
 test('rejects a chat pointing at an undefined account', () => {
   const c = base();
   c.chats['120363419377779909@g.us'].account = 'ghost';

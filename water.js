@@ -7,11 +7,14 @@
 
 'use strict';
 
+const fs = require('node:fs');
 const path = require('node:path');
+const { AsyncLocalStorage } = require('node:async_hooks');
 const { loadConfig, scopeToAccount, resolveChat } = require('./lib/config');
 const { openDb } = require('./lib/db');
 const { createTransport } = require('./lib/transport/client');
 const { createReceiver } = require('./lib/transport/webhook-receiver');
+const { normalize } = require('./lib/transport/normalize');
 const { createOutbound } = require('./lib/db/outbound');
 const { createJidMap } = require('./lib/db/jid-map');
 const { createSessions } = require('./lib/db/sessions');
@@ -34,6 +37,7 @@ const { createSlaWatchdog } = require('./lib/ops/sla-watchdog');
 const { createTransportWatchdog } = require('./lib/ops/transport-watchdog');
 const { createHeartbeat } = require('./lib/ops/heartbeat');
 const { createAuthDisabledGate } = require('./lib/ops/auth-disabled-gate');
+const { createShutdownBarrier } = require('./lib/ops/shutdown-barrier');
 const ipcServer = require('./lib/ipc/server');
 
 // Per-sender cap on the restricted-DM canned reply: at most one send per sender in this
@@ -59,7 +63,19 @@ function buildExpectedWebhook({ port, pathToken, advertiseHost } = {}) {
 
 // Assemble a daemon for one account. Returns { start, stop } so tests can drive it
 // with injected transport/logger without opening real sockets.
-function createDaemon({ config, account, dataDir, standby = false, logger = console, transport: injectedTransport, botIdentity: injectedBotIdentity } = {}) {
+function createDaemon({
+  config,
+  account,
+  dataDir,
+  standby = false,
+  logger = console,
+  transport: injectedTransport,
+  botIdentity: injectedBotIdentity,
+  tmuxRunner: injectedTmuxRunner,
+  containmentProbeTmuxRunner: injectedContainmentProbeTmuxRunner,
+  shutdownTimeoutMs = 300_000,
+  invocationId = process.env.INVOCATION_ID,
+} = {}) {
   const scoped = scopeToAccount(config, account);
   const acc = scoped.accountConfig;
   const dbPath = path.join(dataDir, `${account}.db`);
@@ -72,6 +88,17 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
   const status = createHandlerStatus(db);
   const recordInbound = createRecordInbound(db, { logger });
   const resolve = (jid) => resolveChat(scoped, jid);
+  const shutdownBarrier = createShutdownBarrier();
+  const admissionContext = new AsyncLocalStorage();
+  if (
+    invocationId != null
+    && !/^[0-9a-f]{32}$/.test(invocationId)
+  ) {
+    throw new Error('water: invalid systemd invocation identity');
+  }
+  const lifecycleDetail = (detail) => (
+    invocationId == null ? detail : { ...detail, invocation_id: invocationId }
+  );
 
   // Boot sweeps: any pending outbound is a prior-life crash orphan.
   outbound.sweepCrashed();
@@ -83,22 +110,40 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
   const feedback = createFeedback({ transport, settings: acc.feedback || {}, logger, logEvent });
 
   // Delivery: the tool-dispatcher claude calls mid-turn (reply/edit/react).
-  const toolDispatcher = createChannelsToolDispatcher({
+  let dispatcher = null;
+  const rawToolDispatcher = createChannelsToolDispatcher({
     transport, outbound, account, feedback,
     chunkText: chunkMarkdownText, formatText: toWhatsApp,
     logEvent: (kind, detail) => logEvent(kind, detail), logger,
   });
+  const toolDispatcher = async (call) => {
+    const result = await rawToolDispatcher(call);
+    if (!result?.ok) {
+      const token = admissionContext.getStore()
+        || dispatcher?.inFlightToken(call.sessionKey);
+      token?.taint('delivery-rejected');
+    }
+    return result;
+  };
 
   // Session engine: pinned+vendored claude, tmux, cli backend.
   const sessionLauncher = process.env.ORCHESTRA_SESSION_LAUNCHER;
+  const tmuxSocketName = process.env.ORCHESTRA_TMUX_SOCKET || null;
   const requireExistingServer = process.env.ORCHESTRA_TMUX_REQUIRE_SERVER === '1';
-  logger.log?.(`[water] session containment configured: ${sessionLauncher ? 'yes' : 'no'}`);
+  logger.log?.(`[water] session containment configured: launcher=${sessionLauncher ? 'yes' : 'no'} socket=${tmuxSocketName ? 'yes' : 'no'} require-server=${requireExistingServer ? 'yes' : 'no'}`);
   const vendored = ensureVendoredClaudeBin(CLAUDE_CLI_PINNED_VERSION);
   if (!vendored.ok) throw new Error(`water: claude binary unavailable: ${vendored.reason}`);
-  const tmuxRunner = createTmuxRunner({
+  const tmuxRunner = injectedTmuxRunner || createTmuxRunner({
     logger,
     sessionPrefix: 'water',
+    socketName: tmuxSocketName,
     requireExistingServer,
+  });
+  const containmentProbeTmuxRunner = injectedContainmentProbeTmuxRunner || createTmuxRunner({
+    logger,
+    sessionPrefix: 'water-probe',
+    socketName: 'water',
+    requireExistingServer: true,
   });
   const factory = createProcessFactory({
     config: { chats: scoped.chats, bot: { pm: 'cli' } },
@@ -109,6 +154,25 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
     // orchestra identity — water's names so the shared engine speaks WhatsApp.
     sessionPrefix: 'water',
     bridgeServerName: 'water-bridge',
+    appDataDir: path.join(require('node:os').homedir(), '.water'),
+    attachmentBase: '/tmp/water-attachments',
+    productName: 'water',
+    surfaceName: 'WhatsApp',
+    pmDefault: 'cli',
+  });
+  const containmentProbeFactory = createProcessFactory({
+    config: { chats: scoped.chats, bot: { pm: 'cli' } },
+    tmuxRunner: containmentProbeTmuxRunner,
+    botName: account,
+    toolDispatcher,
+    channelsClaudeBin: vendored.path,
+    db,
+    logger,
+    sessionLauncher,
+    displayHint: WATER_DISPLAY_HINT,
+    maxOutboundFileBytes: (acc.mediaMaxMb || 100) * 1024 * 1024,
+    sessionPrefix: 'water-probe',
+    bridgeServerName: 'water-probe-bridge',
     appDataDir: path.join(require('node:os').homedir(), '.water'),
     attachmentBase: '/tmp/water-attachments',
     productName: 'water',
@@ -132,9 +196,231 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
       onQuestionAsked: (sk, p) => questions?.onAsked(sk, p),   // `ask` tool (docs/ASK_SPEC.md)
     },
   });
+  const containmentProbePm = new ProcessManager({
+    processFactory: containmentProbeFactory,
+    budget: 1,
+    logger,
+  });
+  const containmentProbeSessionKey = 'water-containment-probe';
+  const containmentProbePrefix = `water-probe-${String(account).replace(/[^\w-]/g, '_')}-channels-`;
+  const containmentProbeMarkerPath = path.join(
+    dataDir,
+    `.containment-probe-${String(account).replace(/[^\w-]/g, '_')}.json`,
+  );
+  let containmentProbe = null;
+  let containmentProbeOperation = Promise.resolve();
+
+  function withContainmentProbeLock(operation) {
+    const result = containmentProbeOperation
+      .catch(() => {})
+      .then(operation);
+    containmentProbeOperation = result.catch(() => {});
+    return result;
+  }
+
+  function validateContainmentProbeSessionName(value) {
+    const name = String(value || '');
+    const suffix = name.slice(containmentProbePrefix.length);
+    if (!name.startsWith(containmentProbePrefix) || !/^[0-9a-f]{8}$/.test(suffix)) {
+      throw new Error('containment-probe-session-invalid');
+    }
+    return name;
+  }
+
+  function readContainmentProbeMarker() {
+    try {
+      const stat = fs.lstatSync(containmentProbeMarkerPath);
+      if (
+        !stat.isFile()
+        || stat.isSymbolicLink()
+        || stat.uid !== process.getuid()
+        || (stat.mode & 0o777) !== 0o600
+        || stat.nlink !== 1
+      ) {
+        throw new Error('containment-probe-marker-unsafe');
+      }
+      const fd = fs.openSync(
+        containmentProbeMarkerPath,
+        fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
+      );
+      let marker;
+      try {
+        marker = JSON.parse(fs.readFileSync(fd, 'utf8'));
+      } finally {
+        fs.closeSync(fd);
+      }
+      if (
+        marker?.version !== 2
+        || marker?.state !== 'armed'
+        || marker?.socket_name !== 'water'
+      ) {
+        throw new Error('containment-probe-marker-invalid');
+      }
+      return true;
+    } catch (error) {
+      if (error?.code === 'ENOENT') return false;
+      throw error;
+    }
+  }
+
+  function writeContainmentProbeMarker() {
+    const fd = fs.openSync(
+      containmentProbeMarkerPath,
+      fs.constants.O_WRONLY
+        | fs.constants.O_CREAT
+        | fs.constants.O_EXCL
+        | fs.constants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      fs.writeFileSync(
+        fd,
+        `${JSON.stringify({ version: 2, state: 'armed', socket_name: 'water' })}\n`,
+      );
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    const dirFd = fs.openSync(dataDir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+    try {
+      fs.fsyncSync(dirFd);
+    } finally {
+      fs.closeSync(dirFd);
+    }
+  }
+
+  function removeContainmentProbeMarker() {
+    try {
+      fs.unlinkSync(containmentProbeMarkerPath);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
+
+  async function retireContainmentProbeSessions(expectedSessionName = null) {
+    const sessions = await containmentProbeTmuxRunner.listPolygramSessions(
+      account,
+      { strict: true },
+    );
+    for (const name of sessions) validateContainmentProbeSessionName(name);
+    if (sessions.length > 1) {
+      throw new Error('containment-probe-session-ambiguous');
+    }
+    if (
+      expectedSessionName
+      && sessions.length === 1
+      && sessions[0] !== expectedSessionName
+    ) {
+      throw new Error('containment-probe-session-mismatch');
+    }
+    if (sessions.length === 1) {
+      await containmentProbeTmuxRunner.killSession(sessions[0], { strict: true });
+    }
+    const remaining = await containmentProbeTmuxRunner.listPolygramSessions(
+      account,
+      { strict: true },
+    );
+    if (remaining.length !== 0) {
+      throw new Error('containment-probe-retirement-unproven');
+    }
+    removeContainmentProbeMarker();
+  }
+
+  function stopContainmentProbe(reason = 'containment-probe-complete') {
+    return withContainmentProbeLock(async () => {
+      const active = containmentProbe;
+      const markerArmed = readContainmentProbeMarker();
+      if (!active && !markerArmed) return { ok: true };
+      const activeSessionName = active
+        ? validateContainmentProbeSessionName(active.proc?.tmuxSession)
+        : null;
+      containmentProbe = null;
+      if (active) clearTimeout(active.timer);
+      try {
+        if (active) await containmentProbePm.kill(containmentProbeSessionKey, reason);
+        await retireContainmentProbeSessions(activeSessionName);
+        active?.token.complete('durable-terminal');
+        return { ok: true };
+      } catch (error) {
+        active?.token.fail('containment-probe-retirement-failed');
+        throw error;
+      }
+    });
+  }
+
+  function startContainmentProbe() {
+    return withContainmentProbeLock(async () => {
+      if (
+        !sessionLauncher
+        || tmuxSocketName !== 'water'
+        || !requireExistingServer
+      ) {
+        return { ok: false, reason: 'containment-not-configured' };
+      }
+      if (containmentProbe) {
+        return { ok: false, reason: 'containment-probe-active' };
+      }
+      const token = shutdownBarrier.admit({
+        kind: 'containment-probe',
+        owner: containmentProbeSessionKey,
+      });
+      if (!token) return { ok: false, reason: 'shutting-down' };
+      let intentArmed = false;
+      try {
+        writeContainmentProbeMarker();
+        intentArmed = true;
+        const proc = await containmentProbePm.getOrSpawn(containmentProbeSessionKey, {
+          runtime: 'claude',
+          label: 'containment-probe',
+          cwd: dataDir,
+        });
+        const sessionName = validateContainmentProbeSessionName(proc?.tmuxSession);
+        const timer = setTimeout(() => {
+          stopContainmentProbe('containment-probe-timeout')
+            .catch((error) => logger.error?.(
+              'containment-probe timeout cleanup',
+              error?.message,
+            ));
+        }, 60_000);
+        timer.unref?.();
+        containmentProbe = { proc, token, timer };
+        return { ok: true, session_name: sessionName };
+      } catch (error) {
+        token.fail('containment-probe-start-failed');
+        try {
+          await containmentProbePm.kill(
+            containmentProbeSessionKey,
+            'containment-probe-start-failed',
+          );
+        } catch { /* failed spawn teardown remains a rejected probe */ }
+        if (intentArmed) {
+          try {
+            await retireContainmentProbeSessions();
+          } catch {
+            // Keep the durable intent for replacement-daemon boot cleanup.
+          }
+        }
+        throw error;
+      }
+    });
+  }
 
   function logEvent(kind, detail) {
-    try { db.prepare('INSERT INTO events (ts, chat_jid, kind, detail_json) VALUES (?,?,?,?)').run(Date.now(), detail?.chatJid || detail?.chat_jid || null, kind, JSON.stringify(detail || {})); } catch { /* best effort */ }
+    try {
+      const storedDetail = kind.startsWith('water-')
+        ? lifecycleDetail(detail || {})
+        : (detail || {});
+      const result = db.prepare('INSERT INTO events (ts, chat_jid, kind, detail_json) VALUES (?,?,?,?)')
+        .run(
+          Date.now(),
+          storedDetail.chatJid || storedDetail.chat_jid || null,
+          kind,
+          JSON.stringify(storedDetail),
+        );
+      return Number(result.lastInsertRowid);
+    } catch {
+      return null;
+    }
   }
 
   // Bot identity set {pn, lid} for mention detection; learned at boot from the session.
@@ -171,12 +457,24 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
     await toolDispatcher({ sessionKey: msg.chatJid, chatId: msg.chatJid, toolName: 'reply', text, sourceMsgId: msg.msgId, participantJid: msg.sender.jid });
   }
   async function errorReply(msg, text) {
-    await toolDispatcher({ sessionKey: msg.chatJid, chatId: msg.chatJid, toolName: 'reply', text });
+    await toolDispatcher({
+      sessionKey: msg.chatJid,
+      chatId: msg.chatJid,
+      toolName: 'reply',
+      text,
+      sourceMsgId: msg.msgId,
+    });
   }
   // Canned "DMs aren't monitored" note for a non-allowlisted DM (gate action
   // 'restricted-dm'): no Claude turn, just the reply path — identical shape to errorReply.
   async function restrictedReply(msg) {
-    await toolDispatcher({ sessionKey: msg.chatJid, chatId: msg.chatJid, toolName: 'reply', text: dmRestrictedReply });
+    await toolDispatcher({
+      sessionKey: msg.chatJid,
+      chatId: msg.chatJid,
+      toolName: 'reply',
+      text: dmRestrictedReply,
+      sourceMsgId: msg.msgId,
+    });
   }
   const attachmentsFor = (row) => db.prepare('SELECT * FROM attachments WHERE message_id=?').all(row.id);
 
@@ -209,7 +507,7 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
   const escalator = createEscalator({ ipcBot: esc.ipcBot, chatId: esc.chatId, quietHours: esc.quietHours, logEvent, logger });
   const authDisabledGate = createAuthDisabledGate({ escalate: (sev, t) => escalator.escalate(sev, t), logEvent, logger });
 
-  const dispatcher = createDispatcher({
+  dispatcher = createDispatcher({
     pm, sessions, status, resolveChat: resolve, defaults: scoped.defaults,
     deliverFallback, errorReply, classify, attachmentsFor, fetchMedia, feedback,
     mediaMaxBytes: (acc.mediaMaxMb || 32) * 1024 * 1024, logEvent, logger,
@@ -249,13 +547,13 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
 
   // Route one recorded inbound through the gate. Fire-and-forget from onMessage so the
   // webhook acks fast; a turn runs in the background.
-  async function processInbound(msg, rowId, { isReplay = false } = {}) {
+  async function processInbound(msg, rowId, { isReplay = false, shutdownToken = null } = {}) {
     const row = { id: rowId };
     const d = gate.decide(msg);
     logEvent(`gate-${d.action}`, { chatJid: msg.chatJid, reason: d.reason, sender: msg.sender.jid });
     switch (d.action) {
       case 'dispatch':
-        return dispatcher.dispatch(msg.chatJid, msg, row, { isReplay }).catch((e) => logger.error?.('dispatch', e?.message));
+        return dispatcher.dispatch(msg.chatJid, msg, row, { isReplay, shutdownToken });
       case 'abort':
         try { await pm.procs?.get(msg.chatJid)?.interrupt?.(); } catch { /* */ }
         questions.expireChat(msg.chatJid);   // an interrupt frees the lock but leaves the row open
@@ -290,6 +588,30 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
     }
   }
 
+  function busySummary() {
+    return { account, in_flight: shutdownBarrier.count() };
+  }
+
+  async function runAdmitted({ kind, owner = null, rowId = null }, work) {
+    const token = shutdownBarrier.admit({ kind, owner, rowId });
+    if (!token) return { admitted: false, value: null };
+    try {
+      const value = await admissionContext.run(token, () => work(token));
+      const tainted = token.isTainted();
+      token.complete('durable-terminal');
+      if (tainted && shutdownBarrier.isFenced() && rowId != null) {
+        status.markReplayPending(rowId);
+      }
+      return { admitted: true, value };
+    } catch (error) {
+      if (shutdownBarrier.isFenced() && rowId != null) {
+        try { status.markReplayPending(rowId); } catch { /* DB failure remains crash-like */ }
+      }
+      token.fail(error?.code === 'TIMEOUT' ? 'ambiguous' : 'rejected');
+      throw error;
+    }
+  }
+
   async function onMessage(msg) {
     jidMap.observeSender({ jid: msg.sender.jid, altJid: msg.sender.altJid, pushName: msg.sender.pushName, ts: msg.tsMs });
     // isFromMe: never dispatched. Our own send echo (matches a minted id) is delivery
@@ -308,20 +630,38 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
     if (msg.edit?.targetMsgId) {
       const target = msg.edit.targetMsgId;
       try {
-        db.prepare('UPDATE messages SET text=@text, edited_ts=@ts WHERE chat_jid=@chat AND msg_id=@target')
-          .run({ text: msg.text ?? null, ts: msg.tsMs, chat: msg.chatJid, target });
+        db.prepare(`
+          UPDATE messages
+             SET text=@text,
+                 raw_json=@rawJson,
+                 quote_msg_id=@quoteMsgId,
+                 quote_participant=@quoteParticipant,
+                 edited_ts=@ts
+           WHERE chat_jid=@chat AND msg_id=@target
+        `).run({
+          text: msg.text ?? null,
+          rawJson: msg.rawJson ?? null,
+          quoteMsgId: msg.quote?.msgId ?? null,
+          quoteParticipant: msg.quote?.participantJid ?? null,
+          ts: msg.tsMs,
+          chat: msg.chatJid,
+          target,
+        });
       } catch (e) { logger.error?.('record edit', e?.message); }
       logEvent('inbound-edit', { chatJid: msg.chatJid, target });
 
       // Gate the edited content under the ORIGINAL message id (normalize re-extracted its
       // mentions/quote from the edited payload).
       const edited = { ...msg, msgId: target, edit: undefined };
-      if (gate.decide(edited).action !== 'dispatch') return;   // still unaddressed → text-only
+      const decision = gate.decide(edited);
+      if (decision.action !== 'dispatch') return;   // still unaddressed → text-only
 
       const proc = pm.get?.(msg.chatJid);
       // Turn in flight → fold the correction in (like polygram's edit-correction),
       // rather than starting a competing turn.
-      if (proc?.inFlight && proc.injectUserMessage) {
+      const editBelongsToAdmittedTurn = !shutdownBarrier.isFenced()
+        || shutdownBarrier.hasActiveOwner(msg.chatJid);
+      if (editBelongsToAdmittedTurn && proc?.inFlight && proc.injectUserMessage) {
         const ok = proc.injectUserMessage({
           content: `[edit] The user edited an earlier message — it now reads: ${msg.text ?? ''}`,
           priority: 'next', msgId: target, source: 'edit-fold',
@@ -333,33 +673,88 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
       if (status.hasCompletedTurn(msg.chatJid, target)) return;
       const row = db.prepare("SELECT id FROM messages WHERE chat_jid=? AND msg_id=? AND direction='in' ORDER BY id DESC LIMIT 1").get(msg.chatJid, target);
       if (row) {
+        if (shutdownBarrier.isFenced()) {
+          status.resetForReplay(row.id);
+          logEvent('edit-fenced-for-replay', { chatJid: msg.chatJid, target });
+          return;
+        }
         logEvent('edit-redispatch', { chatJid: msg.chatJid, target });
-        dispatcher.dispatch(msg.chatJid, edited, { id: row.id }).catch((e) => logger.error?.('dispatch(edit)', e?.message));
+        runAdmitted(
+          { kind: 'edit', owner: msg.chatJid, rowId: row.id },
+          (token) => dispatcher.dispatch(
+            msg.chatJid,
+            edited,
+            { id: row.id },
+            { shutdownToken: token },
+          ),
+        ).catch((e) => logger.error?.('dispatch(edit)', e?.message));
       }
       return;
     }
     const rec = recordInbound(msg, { account }); // throws on DB failure -> 500 -> wuzapi retries
     if (rec.deduped || !rec.rowId) return;       // already handled (retry/replay/reorder)
-    processInbound(msg, rec.rowId).catch((e) => logger.error?.('processInbound', e?.message));
+    if (shutdownBarrier.isFenced()) {
+      // An answer to a question owned by an admitted turn is completion evidence,
+      // not a new turn. Everything else stays in `received` for boot replay.
+      if (
+        gate.decide(msg).action === 'consume'
+        && shutdownBarrier.hasActiveOwner(msg.chatJid)
+      ) {
+        await processInbound(msg, rec.rowId);
+      }
+      return;
+    }
+    runAdmitted(
+      { kind: 'webhook', owner: msg.chatJid, rowId: rec.rowId },
+      (token) => processInbound(msg, rec.rowId, { shutdownToken: token }),
+    ).catch((e) => logger.error?.('processInbound', e?.message));
   }
 
   async function onConnectionEvent(ev) {
-    await transportWatchdog.onConnectionEvent(ev);
+    if (shutdownBarrier.isFenced()) {
+      logEvent('connection-during-shutdown', { kind: ev.kind });
+      return;
+    }
+    const admission = await runAdmitted(
+      { kind: 'connection-event', owner: 'transport' },
+      () => transportWatchdog.onConnectionEvent(ev),
+    );
+    return admission.value;
   }
 
   // IPC-injected synthetic turn (cron jobs). Trusted (IPC-secret-gated) so it skips
   // the mention gate — but still fail-closed on the configured-chat boundary: never
   // dispatch a Claude turn + WhatsApp send into a chat that isn't in config.
   async function injectTurn({ chat_id, text, source = 'cron' }) {
+    if (shutdownBarrier.isFenced()) return { ok: false, reason: 'shutting-down' };
     if (!resolve(chat_id)) return { ok: false, reason: 'unknown-chat' };
+    const token = shutdownBarrier.admit({ kind: 'ipc-inject', owner: chat_id });
+    if (!token) return { ok: false, reason: 'shutting-down' };
     const synthetic = {
       chatJid: chat_id, chatType: chat_id.endsWith('@g.us') ? 'group' : 'dm', msgId: `inj-${Date.now()}`,
       sender: { jid: 'water:inject', altJid: null, pushName: source, pn: null, lid: null },
       isFromMe: false, tsMs: Date.now(), receivedAtMs: Date.now(), text, mentions: [], attachments: [],
     };
-    const rec = recordInbound(synthetic, { account, source: `cron:${source}` });
-    if (rec.rowId && !rec.deduped) await dispatcher.dispatch(chat_id, synthetic, { id: rec.rowId });
-    return { ok: true };
+    let rec = null;
+    try {
+      rec = recordInbound(synthetic, { account, source: `cron:${source}` });
+      token.rowId = rec.rowId || null;
+      if (rec.rowId && !rec.deduped) {
+        await admissionContext.run(token, () => dispatcher.dispatch(
+          chat_id, synthetic, { id: rec.rowId }, { shutdownToken: token },
+        ));
+      }
+      const tainted = token.isTainted();
+      token.complete('durable-terminal');
+      if (tainted && shutdownBarrier.isFenced() && rec?.rowId) {
+        status.markReplayPending(rec.rowId);
+      }
+      return { ok: true };
+    } catch (error) {
+      if (shutdownBarrier.isFenced() && rec?.rowId) status.markReplayPending(rec.rowId);
+      token.fail('rejected');
+      throw error;
+    }
   }
 
   // Learn the bot's own identity set for mention gating.
@@ -376,13 +771,24 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
   //  - `received` rows (never gated) ALWAYS re-gate — no turn ever started, so no dup.
   //  - `dispatched`/`replay-pending` rows (a turn had started): crash → recover;
   //    clean restart → skip (they were drained at shutdown, not lost).
-  // Completion is gated on turn_metrics OR a delivered bot-reply after the inbound
-  // (an out-row source='bot-reply' status='sent' ts >= inbound ts). Candidates
-  // shadowed by a newer authorized abort are dropped (never resurrect a killed turn).
+  // A delivered bot-reply after the inbound is the only replay-suppression evidence
+  // (an out-row source='bot-reply' status='sent' ts >= inbound ts). A success metric can
+  // precede fallback delivery, so it cannot make a nonterminal row safe to skip.
+  // Candidates shadowed by a newer authorized abort are dropped (never resurrect a
+  // killed turn).
   const readCleanShutdown = db.prepare("SELECT v FROM daemon_state WHERE k='clean_shutdown_at'");
   const clearCleanShutdown = db.prepare("DELETE FROM daemon_state WHERE k='clean_shutdown_at'");
   const newerAbort = db.prepare("SELECT text, sender_jid, chat_jid FROM messages WHERE chat_jid=? AND direction='in' AND ts>? ");
-  const botReplyAfterIn = db.prepare("SELECT 1 FROM messages WHERE chat_jid=? AND direction='out' AND source='bot-reply' AND status='sent' AND ts>=? LIMIT 1");
+  const botReplyForIn = db.prepare(`
+    SELECT 1
+      FROM messages
+     WHERE chat_jid=?
+       AND direction='out'
+       AND source='bot-reply'
+       AND status='sent'
+       AND quote_msg_id=?
+     LIMIT 1
+  `);
   const { isAbort } = require('./lib/handlers/abort-detector');
 
   async function bootReplay(windowMs = 2 * 3600_000) {
@@ -390,25 +796,77 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
     let cleanRestart = false;
     try { const m = readCleanShutdown.get(); cleanRestart = !!(m && m.v); clearCleanShutdown.run(); }
     catch { cleanRestart = false; } // any ambiguity → treat as crash → recover
-    let replayed = 0, skipped = 0;
+    let replayed = 0, skipped = 0, failed = 0;
     for (const r of status.replayCandidates(cutoff)) {
       const startedTurn = r.handler_status === 'dispatched' || r.handler_status === 'replay-pending';
-      // completion: a metrics row OR a delivered reply after this inbound
-      if (status.hasCompletedTurn(r.chat_jid, r.msg_id) || botReplyAfterIn.get(r.chat_jid, r.ts)) { status.markReplaySkipped(r.id); continue; }
+      // A metrics row can be written before fallback delivery. Only durable reply
+      // evidence may suppress a still-nonterminal replay candidate.
+      if (botReplyForIn.get(r.chat_jid, r.msg_id)) {
+        status.markReplaySkipped(r.id);
+        continue;
+      }
       // clean restart: a turn that had started was drained, not lost — skip it.
       if (startedTurn && cleanRestart) { status.markReplaySkipped(r.id); skipped++; continue; }
       // never resurrect a turn the user explicitly aborted after this message.
       const abortShadow = newerAbort.all(r.chat_jid, r.ts).some((a) => isAbort(a.text));
       if (abortShadow) { status.markReplaySkipped(r.id); skipped++; continue; }
-      status.markReplayAttempted(r.id);
       const msg = reconstruct(r);
-      try { await processInbound(msg, r.id, { isReplay: true }); replayed++; } catch (e) { logger.error?.('replay', e?.message); }
+      try {
+        const admission = await runAdmitted(
+          { kind: 'boot-replay', owner: r.chat_jid, rowId: r.id },
+          async (token) => {
+            await processInbound(msg, r.id, { isReplay: true, shutdownToken: token });
+          },
+        );
+        if (!admission.admitted) break;
+        replayed++;
+      } catch (e) {
+        status.markReplayPending(r.id);
+        failed++;
+        logger.error?.('replay', e?.message);
+      }
     }
     if (replayed || skipped) logger.log?.(`[water] boot replay: re-dispatched ${replayed}, skipped ${skipped} (${cleanRestart ? 'clean' : 'crash'} restart)`);
+    const unresolved = status.replayCandidates(cutoff).length;
+    if (failed || unresolved) {
+      logEvent('water-boot-replay-incomplete', { replayed, skipped, failed, unresolved });
+      const error = new Error(`water: boot replay incomplete (${failed} failed, ${unresolved} unresolved)`);
+      error.code = 'BOOT_REPLAY_INCOMPLETE';
+      throw error;
+    }
+    logEvent('water-boot-replay-complete', { replayed, skipped, failed: 0, unresolved: 0 });
+    return { replayed, skipped, failed: 0, unresolved: 0 };
   }
 
-  // Rebuild a minimal normalized message from a stored row for replay.
+  // Rebuild from the committed raw webhook so gate-relevant structured context
+  // (native mentions and edited quotes) survives a restart.
   function reconstruct(r) {
+    if (r.raw_json) {
+      try {
+        const event = normalize(JSON.parse(r.raw_json));
+        if (event?.type === 'message' && event.message) {
+          return {
+            ...event.message,
+            chatJid: r.chat_jid,
+            chatType: r.chat_jid.endsWith('@g.us') ? 'group' : 'dm',
+            msgId: r.msg_id,
+            sender: {
+              ...event.message.sender,
+              jid: r.sender_jid,
+              altJid: r.sender_alt_jid,
+              pushName: r.user,
+            },
+            isFromMe: !!r.is_from_me,
+            tsMs: r.ts,
+            receivedAtMs: r.received_at,
+            text: r.text,
+            _isReplay: true,
+          };
+        }
+      } catch {
+        // Rows predating raw webhook storage keep the minimal compatibility path.
+      }
+    }
     return {
       chatJid: r.chat_jid, chatType: r.chat_jid.endsWith('@g.us') ? 'group' : 'dm', msgId: r.msg_id,
       sender: { jid: r.sender_jid, altJid: r.sender_alt_jid, pushName: r.user, pn: null, lid: null },
@@ -424,88 +882,251 @@ function createDaemon({ config, account, dataDir, standby = false, logger = cons
   let pollTimer = null;
   let ambigTimer = null;
   let questionTimer = null;
-  async function start({ withTimers = true } = {}) {
-    await learnIdentity();
-    const pathToken = acc.webhook?.pathToken || 'water';
-    const bindHost = acc.webhook?.bindHost || '127.0.0.1';
-    // HMAC posture (fail-loud): require a signed webhook UNLESS explicitly opted out with
-    // webhook.requireHmac:false (trust the receiver's bind host + host firewall as the
-    // boundary). Never a silent skip: a missing key with requireHmac still on aborts the boot.
-    const hmacKey = acc.wuzapi.hmacKey || '';
-    const requireHmac = acc.webhook?.requireHmac !== false;
-    if (requireHmac && !hmacKey) {
-      throw new Error('water: no wuzapi.hmacKey configured. Set the shared HMAC secret, or set webhook.requireHmac:false to trust the bind host + firewall (unsigned webhooks).');
-    }
-    const skipHmac = !requireHmac && !hmacKey;
-    if (skipHmac) {
-      const wildcard = bindHost === '0.0.0.0' || bindHost === '::';
-      logger.warn?.(`[water] HMAC DISABLED (webhook.requireHmac:false) — unsigned webhooks trusted; ${wildcard
-        ? `bind is ${bindHost} (ALL interfaces) — the ONLY boundary is the host firewall`
-        : `the boundary is the ${bindHost} bind + host firewall`}`);
-    }
-    heartbeat.start();
-    receiver = createReceiver({
-      port: acc.webhook.port, host: bindHost, pathToken, hmacKey, skipHmac,
-      healthPayload: () => heartbeat.healthPayload(),
-      emit: logEvent, logger,
-      handlers: { onMessage, onConnectionEvent },
-    });
-    const addr = await receiver.listen();
-    logger.log?.(`[water] account=${account} webhook on ${addr.address}:${addr.port}/hook/${pathToken}`);
-    // Eager webhook assert/repair at boot (not just the 60s poll): a reverted/lost
-    // wuzapi webhook subscription would otherwise silently drop all inbound until the
-    // first poll fires. Best-effort — a down wuzapi is caught by the poll + escalation.
-    try { await transportWatchdog.poll(); } catch (e) { logger.warn?.('boot webhook reconcile', e?.message); }
+  let stopPromise = null;
+  let startupFailed = false;
 
-    // water's own IPC socket (cron injectTurn, operator sends). Allowlisted ops.
+  function startWorkTimer(kind, intervalMs, work) {
+    const timer = setInterval(() => {
+      runAdmitted(
+        { kind: `timer:${kind}`, owner: `timer:${kind}` },
+        () => work(),
+      ).catch((error) => logger.error?.(kind, error?.message));
+    }, intervalMs);
+    timer.unref?.();
+    return timer;
+  }
+
+  async function sendTextFromIpc(params) {
+    if (shutdownBarrier.isFenced()) return { ok: false, reason: 'shutting-down' };
+    const token = shutdownBarrier.admit({ kind: 'ipc-send', owner: params.chat_id });
+    if (!token) return { ok: false, reason: 'shutting-down' };
     try {
+      const result = await admissionContext.run(token, () => toolDispatcher({
+        sessionKey: params.chat_id,
+        chatId: params.chat_id,
+        toolName: 'reply',
+        text: params.text,
+      }));
+      if (!result?.ok) {
+        token.fail('delivery-rejected');
+        return { ok: false, reason: 'delivery-rejected' };
+      }
+      token.complete('ipc-delivered');
+      return result;
+    } catch (error) {
+      token.fail('rejected');
+      throw error;
+    }
+  }
+
+  async function start({ withTimers = true } = {}) {
+    const startupToken = shutdownBarrier.admit({ kind: 'startup', owner: 'daemon' });
+    if (!startupToken) {
+      const error = new Error('water: start rejected during shutdown');
+      error.code = 'SHUTTING_DOWN';
+      throw error;
+    }
+    logEvent('water-start', { admitted: true });
+    const assertStartOpen = () => {
+      if (!shutdownBarrier.isFenced()) return;
+      const error = new Error('water: shutdown began during startup');
+      error.code = 'SHUTTING_DOWN';
+      throw error;
+    };
+    try {
+      await stopContainmentProbe('daemon-start-recovery');
+      assertStartOpen();
+      await admissionContext.run(startupToken, () => learnIdentity());
+      assertStartOpen();
+      const pathToken = acc.webhook?.pathToken || 'water';
+      const bindHost = acc.webhook?.bindHost || '127.0.0.1';
+      // HMAC posture (fail-loud): require a signed webhook UNLESS explicitly opted out with
+      // webhook.requireHmac:false (trust the receiver's bind host + host firewall as the
+      // boundary). Never a silent skip: a missing key with requireHmac still on aborts the boot.
+      const hmacKey = acc.wuzapi.hmacKey || '';
+      const requireHmac = acc.webhook?.requireHmac !== false;
+      if (requireHmac && !hmacKey) {
+        throw new Error('water: no wuzapi.hmacKey configured. Set the shared HMAC secret, or set webhook.requireHmac:false to trust the bind host + firewall (unsigned webhooks).');
+      }
+      const skipHmac = !requireHmac && !hmacKey;
+      if (skipHmac) {
+        const wildcard = bindHost === '0.0.0.0' || bindHost === '::';
+        logger.warn?.(`[water] HMAC DISABLED (webhook.requireHmac:false) — unsigned webhooks trusted; ${wildcard
+          ? `bind is ${bindHost} (ALL interfaces) — the ONLY boundary is the host firewall`
+          : `the boundary is the ${bindHost} bind + host firewall`}`);
+      }
+      heartbeat.start();
+      receiver = createReceiver({
+        port: acc.webhook.port, host: bindHost, pathToken, hmacKey, skipHmac,
+        healthPayload: () => heartbeat.healthPayload(),
+        emit: logEvent, logger,
+        handlers: { onMessage, onConnectionEvent },
+      });
+      const addr = await receiver.listen();
+      assertStartOpen();
+      logEvent('water-receiver-ready', { ready: true });
+      logger.log?.(`[water] account=${account} webhook on ${addr.address}:${addr.port}/hook/${pathToken}`);
+      // Eager webhook assert/repair at boot (not just the 60s poll): a reverted/lost
+      // wuzapi webhook subscription would otherwise silently drop all inbound until the
+      // first poll fires. Best-effort — a down wuzapi is caught by the poll + escalation.
+      try {
+        await runAdmitted(
+          { kind: 'startup-reconcile', owner: 'transport' },
+          () => transportWatchdog.poll(),
+        );
+      } catch (e) {
+        logger.warn?.('boot webhook reconcile', e?.message);
+      }
+      assertStartOpen();
+
+      // water's own IPC socket (cron injectTurn, operator sends). Allowlisted ops.
       const secret = ipcServer.writeSecret(account);
-      ipc = ipcServer.start({
+      ipc = await ipcServer.start({
         path: ipcServer.socketPathFor(account),
         secret,
         logger,
         handlers: {
           ping: async () => ({ pong: true }),
-          injectTurn: async (p) => injectTurn(p),
-          sendText: async (p) => toolDispatcher({ sessionKey: p.chat_id, chatId: p.chat_id, toolName: 'reply', text: p.text }),
+          busy: async () => busySummary(),
+          injectTurn: async (params) => injectTurn(params),
+          sendText: async (params) => sendTextFromIpc(params),
+          containmentProbeStart: async () => startContainmentProbe(),
+          containmentProbeStop: async () => stopContainmentProbe(),
         },
       });
-    } catch (e) { logger.warn?.('ipc start failed', e?.message); }
+      assertStartOpen();
 
-    await bootReplay();
+      await bootReplay();
+      assertStartOpen();
 
-    if (withTimers) {
-      slaTimer = setInterval(() => sla.tick().catch((e) => logger.error?.('sla', e?.message)), 30_000); slaTimer.unref?.();
-      pollTimer = setInterval(() => transportWatchdog.poll().catch((e) => logger.error?.('poll', e?.message)), 60_000); pollTimer.unref?.();
-      // Ambiguous-send sweeper: flip outbound rows stuck 'pending' > 60s to
-      // failed('ambiguous-send') (a crashed/lost send callback) and GC the sent-cache.
-      ambigTimer = setInterval(() => {
-        try { for (const r of outbound.sweepAmbiguous()) logEvent('ambiguous-send', { chatJid: r.chat_jid, msgId: r.msg_id }); }
-        catch (e) { logger.error?.('ambig-sweep', e?.message); }
-      }, 30_000); ambigTimer.unref?.();
-      // `ask` timeout sweep — the SOLE anti-wedge for a DM ask (the daemon defers its own
-      // turn-timeout while a question is open, so this frees a stuck DM turn + its lock).
-      questionTimer = setInterval(() => { try { questions.sweep(); } catch (e) { logger.error?.('question-sweep', e?.message); } }, 30_000); questionTimer.unref?.();
+      if (withTimers) {
+        slaTimer = startWorkTimer('sla', 30_000, () => sla.tick());
+        pollTimer = startWorkTimer('poll', 60_000, () => transportWatchdog.poll());
+        // Ambiguous-send sweeper: flip outbound rows stuck 'pending' > 60s to
+        // failed('ambiguous-send') (a crashed/lost send callback) and GC the sent-cache.
+        ambigTimer = startWorkTimer('ambig-sweep', 30_000, () => {
+          for (const r of outbound.sweepAmbiguous()) {
+            logEvent('ambiguous-send', { chatJid: r.chat_jid, msgId: r.msg_id });
+          }
+        });
+        // `ask` timeout sweep — the SOLE anti-wedge for a DM ask (the daemon defers its own
+        // turn-timeout while a question is open, so this frees a stuck DM turn + its lock).
+        questionTimer = startWorkTimer('question-sweep', 30_000, () => questions.sweep());
+      }
+      logEvent('water-admission-open', { ready: true });
+      startupToken.complete('durable-terminal');
+      return { port: addr.port };
+    } catch (error) {
+      startupFailed = true;
+      startupToken.fail('startup-rejected');
+      throw error;
     }
-    return { port: addr.port };
   }
 
   async function stop() {
-    if (slaTimer) clearInterval(slaTimer);
-    if (pollTimer) clearInterval(pollTimer);
-    if (ambigTimer) clearInterval(ambigTimer);
-    if (questionTimer) clearInterval(questionTimer);
-    heartbeat.stop();
-    if (receiver) await receiver.close();
-    try { ipc?.close?.(); } catch { /* */ }
-    status.markInFlightForShutdown();
-    db.prepare("INSERT OR REPLACE INTO daemon_state (k,v) VALUES ('clean_shutdown_at', ?)").run(String(Date.now()));
-    try { await pm.shutdown?.(); } catch { /* */ }
-    db.close();
+    if (stopPromise) return stopPromise;
+    stopPromise = (async () => {
+      if (slaTimer) clearInterval(slaTimer);
+      if (pollTimer) clearInterval(pollTimer);
+      if (ambigTimer) clearInterval(ambigTimer);
+      if (questionTimer) clearInterval(questionTimer);
+      heartbeat.stop();
+
+      // Clearing callbacks and fencing are synchronous, so nothing can slip
+      // between the timer stop and the admitted-token snapshot.
+      const snapshot = shutdownBarrier.fence();
+      logEvent('water-shutdown-fenced', { admitted: snapshot.length });
+      let containmentProbeClean = true;
+      try {
+        await stopContainmentProbe('daemon-shutdown');
+      } catch {
+        containmentProbeClean = false;
+      }
+      const drain = await shutdownBarrier.wait(snapshot, { timeoutMs: shutdownTimeoutMs });
+      logEvent('water-shutdown-drain', {
+        clean: drain.clean,
+        timed_out: drain.timedOut,
+        admitted: drain.admitted,
+        completed: drain.completed,
+        rejected: drain.rejected,
+      });
+      let clean = drain.clean && containmentProbeClean && !startupFailed;
+
+      try { if (receiver) await receiver.close(); } catch { clean = false; }
+      try { if (ipc) await ipc.close(); } catch { clean = false; }
+      try { await pm.shutdown?.(); } catch { clean = false; }
+
+      try {
+        if (clean) {
+          db.prepare("INSERT OR REPLACE INTO daemon_state (k,v) VALUES ('clean_shutdown_at', ?)").run(String(Date.now()));
+        } else {
+          status.markInFlightForShutdown();
+          clearCleanShutdown.run();
+        }
+      } catch {
+        clean = false;
+        try {
+          status.markInFlightForShutdown();
+          clearCleanShutdown.run();
+        } catch { /* DB ambiguity stays crash-like */ }
+      }
+      const stopEventId = logEvent('water-stop', { clean });
+      try {
+        db.close();
+      } catch {
+        // A failed close makes durability ambiguous even if writing the clean marker
+        // succeeded. Invalidate it while the handle is still usable, then retry close.
+        clean = false;
+        try {
+          status.markInFlightForShutdown();
+          clearCleanShutdown.run();
+        } catch { /* a persisted clean marker remains an unavoidable DB failure */ }
+        if (stopEventId != null) {
+          try {
+            db.prepare('UPDATE events SET detail_json=? WHERE id=?')
+              .run(JSON.stringify(lifecycleDetail({ clean: false })), stopEventId);
+          } catch { /* lifecycle evidence shares the same DB ambiguity */ }
+        }
+        try { db.close(); } catch { /* process exit is the final containment boundary */ }
+      }
+      return { ...drain, clean };
+    })();
+    return stopPromise;
   }
 
-  return { start, stop, db, pm, gate, dispatcher, onMessage, processInbound, injectTurn,
-    _internal: { transport, outbound, jidMap, sessions, status, toolDispatcher, botIdentity, escalator, sla, transportWatchdog, heartbeat } };
+  return {
+    start,
+    stop,
+    db,
+    pm,
+    gate,
+    dispatcher,
+    onMessage,
+    onConnectionEvent,
+    processInbound,
+    injectTurn,
+    busySummary,
+    _internal: {
+      transport,
+      outbound,
+      jidMap,
+      sessions,
+      status,
+      toolDispatcher,
+      botIdentity,
+      escalator,
+      sla,
+      transportWatchdog,
+      heartbeat,
+      shutdownBarrier,
+      runAdmitted,
+      sendTextFromIpc,
+      startContainmentProbe,
+      stopContainmentProbe,
+      containmentProbePm,
+      questions,
+    },
+  };
 }
 
 // CLI entry
@@ -526,9 +1147,27 @@ async function main() {
   const configPath = args.config || path.join(args.dataDir, 'config.json');
   const config = loadConfig(configPath);
   const daemon = createDaemon({ config, account: args.account, dataDir: args.dataDir, standby: args.standby });
-  const shutdown = async (sig) => { console.log(`[water] ${sig} — shutting down`); try { await daemon.stop(); } finally { process.exit(0); } };
-  for (const s of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(s, () => shutdown(s));
-  await daemon.start();
+  let shuttingDown = false;
+  let shutdownPromise = null;
+  const shutdown = (sig) => {
+    if (shutdownPromise) return shutdownPromise;
+    shuttingDown = true;
+    console.log(`[water] ${sig} — shutting down`);
+    shutdownPromise = daemon.stop().finally(() => process.exit(0));
+    return shutdownPromise;
+  };
+  for (const s of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(s, () => { void shutdown(s); });
+  }
+  try {
+    await daemon.start();
+  } catch (error) {
+    if (shuttingDown) {
+      await shutdownPromise;
+      return;
+    }
+    throw error;
+  }
 }
 
 if (require.main === module) {
