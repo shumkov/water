@@ -203,12 +203,24 @@ function createDaemon({
     await toolDispatcher({ sessionKey: msg.chatJid, chatId: msg.chatJid, toolName: 'reply', text, sourceMsgId: msg.msgId, participantJid: msg.sender.jid });
   }
   async function errorReply(msg, text) {
-    await toolDispatcher({ sessionKey: msg.chatJid, chatId: msg.chatJid, toolName: 'reply', text });
+    await toolDispatcher({
+      sessionKey: msg.chatJid,
+      chatId: msg.chatJid,
+      toolName: 'reply',
+      text,
+      sourceMsgId: msg.msgId,
+    });
   }
   // Canned "DMs aren't monitored" note for a non-allowlisted DM (gate action
   // 'restricted-dm'): no Claude turn, just the reply path — identical shape to errorReply.
   async function restrictedReply(msg) {
-    await toolDispatcher({ sessionKey: msg.chatJid, chatId: msg.chatJid, toolName: 'reply', text: dmRestrictedReply });
+    await toolDispatcher({
+      sessionKey: msg.chatJid,
+      chatId: msg.chatJid,
+      toolName: 'reply',
+      text: dmRestrictedReply,
+      sourceMsgId: msg.msgId,
+    });
   }
   const attachmentsFor = (row) => db.prepare('SELECT * FROM attachments WHERE message_id=?').all(row.id);
 
@@ -513,7 +525,16 @@ function createDaemon({
   const readCleanShutdown = db.prepare("SELECT v FROM daemon_state WHERE k='clean_shutdown_at'");
   const clearCleanShutdown = db.prepare("DELETE FROM daemon_state WHERE k='clean_shutdown_at'");
   const newerAbort = db.prepare("SELECT text, sender_jid, chat_jid FROM messages WHERE chat_jid=? AND direction='in' AND ts>? ");
-  const botReplyAfterIn = db.prepare("SELECT 1 FROM messages WHERE chat_jid=? AND direction='out' AND source='bot-reply' AND status='sent' AND ts>=? LIMIT 1");
+  const botReplyForIn = db.prepare(`
+    SELECT 1
+      FROM messages
+     WHERE chat_jid=?
+       AND direction='out'
+       AND source='bot-reply'
+       AND status='sent'
+       AND quote_msg_id=?
+     LIMIT 1
+  `);
   const { isAbort } = require('./lib/handlers/abort-detector');
 
   async function bootReplay(windowMs = 2 * 3600_000) {
@@ -526,7 +547,7 @@ function createDaemon({
       const startedTurn = r.handler_status === 'dispatched' || r.handler_status === 'replay-pending';
       // A metrics row can be written before fallback delivery. Only durable reply
       // evidence may suppress a still-nonterminal replay candidate.
-      if (botReplyAfterIn.get(r.chat_jid, r.ts)) {
+      if (botReplyForIn.get(r.chat_jid, r.msg_id)) {
         status.markReplaySkipped(r.id);
         continue;
       }
@@ -608,6 +629,7 @@ function createDaemon({
   let ambigTimer = null;
   let questionTimer = null;
   let stopPromise = null;
+  let startupFailed = false;
 
   function startWorkTimer(kind, intervalMs, work) {
     const timer = setInterval(() => {
@@ -737,6 +759,7 @@ function createDaemon({
       startupToken.complete('durable-terminal');
       return { port: addr.port };
     } catch (error) {
+      startupFailed = true;
       startupToken.fail('startup-rejected');
       throw error;
     }
@@ -763,7 +786,7 @@ function createDaemon({
         completed: drain.completed,
         rejected: drain.rejected,
       });
-      let clean = drain.clean;
+      let clean = drain.clean && !startupFailed;
 
       try { if (receiver) await receiver.close(); } catch { clean = false; }
       try { if (ipc) await ipc.close(); } catch { clean = false; }

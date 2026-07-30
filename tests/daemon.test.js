@@ -736,6 +736,54 @@ test('boot replay preserves a structured native mention from the stored webhook'
   await d.stop();
 });
 
+test('a reply to a later message does not suppress an earlier replay candidate', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-replay-correlated-'));
+  const seed = openDb(path.join(dir, 'umi.db'));
+  seed.prepare(`
+    INSERT INTO messages
+      (chat_jid,msg_id,sender_jid,user,text,direction,source,account,
+       handler_status,status,quote_msg_id,ts,received_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `).run(
+    GROUP, 'R-EARLIER', '55@lid', 'Alice', 'umi earlier', 'in',
+    'whatsapp', 'umi', 'replay-pending', 'received', null,
+    Date.now() - 10, Date.now() - 10,
+  );
+  seed.prepare(`
+    INSERT INTO messages
+      (chat_jid,msg_id,sender_jid,user,text,direction,source,account,
+       handler_status,status,quote_msg_id,ts,received_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `).run(
+    GROUP, 'R-LATER', '55@lid', 'Alice', 'umi later', 'in',
+    'whatsapp', 'umi', 'replied', 'received', null,
+    Date.now() - 5, Date.now() - 5,
+  );
+  seed.prepare(`
+    INSERT INTO messages
+      (chat_jid,msg_id,sender_jid,user,text,direction,source,account,
+       handler_status,status,quote_msg_id,ts,received_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `).run(
+    GROUP, 'OUT-LATER', BOT_PN, null, 'later answer', 'out',
+    'bot-reply', 'umi', null, 'sent', 'R-LATER',
+    Date.now(), Date.now(),
+  );
+  seed.close();
+
+  const d = daemon(dir, []);
+  let dispatched = 0;
+  d.pm.getOrSpawn = async () => {};
+  d.pm.procs = new Map([[GROUP, { claudeSessionId: 's' }]]);
+  d.pm.send = async () => {
+    dispatched++;
+    return { alreadyDelivered: true };
+  };
+  await d.start({ withTimers: false });
+  assert.equal(dispatched, 1, 'only evidence tied to the same inbound may suppress replay');
+  await d.stop();
+});
+
 test('an edit fenced during shutdown replays its updated structured mention', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-replay-edit-'));
   const originalRaw = {
@@ -848,6 +896,50 @@ test('failed boot replay stays replay-pending and prevents readiness', async () 
     d.db.prepare("SELECT handler_status FROM messages WHERE msg_id='R-FAILED'").get().handler_status,
     'replay-pending',
   );
+  await d.stop();
+
+  const next = daemon(dir, []);
+  let dispatched = 0;
+  next.pm.getOrSpawn = async () => {};
+  next.pm.procs = new Map([[GROUP, { claudeSessionId: 's' }]]);
+  next.pm.send = async () => {
+    dispatched++;
+    return { alreadyDelivered: true };
+  };
+  await next.start({ withTimers: false });
+  assert.equal(
+    dispatched,
+    1,
+    'a failed boot must stay crash-like so the next boot retries the row',
+  );
+  await next.stop();
+});
+
+test('explicit replay-pending rows are retried even after the legacy replay window', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'water-replay-old-'));
+  const old = Date.now() - 3 * 3600_000;
+  const seed = openDb(path.join(dir, 'umi.db'));
+  seed.prepare(`
+    INSERT INTO messages
+      (chat_jid,msg_id,sender_jid,user,text,direction,account,
+       handler_status,ts,received_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)
+  `).run(
+    GROUP, 'R-OLD-PENDING', '55@lid', 'Alice', 'umi recover this',
+    'in', 'umi', 'replay-pending', old, old,
+  );
+  seed.close();
+
+  const d = daemon(dir, []);
+  let dispatched = 0;
+  d.pm.getOrSpawn = async () => {};
+  d.pm.procs = new Map([[GROUP, { claudeSessionId: 's' }]]);
+  d.pm.send = async () => {
+    dispatched++;
+    return { alreadyDelivered: true };
+  };
+  await d.start({ withTimers: false });
+  assert.equal(dispatched, 1);
   await d.stop();
 });
 
